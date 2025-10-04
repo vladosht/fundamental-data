@@ -380,10 +380,26 @@ if __name__ == '__main__':
     with mp.Pool(processes=max_jobs) as p:
         all_pivots = list(p.map(process_single_pivot,all_pivots))
 
-print('Saving results as CSV...')
+print('Building dataset...')
 all_pivots = pd.concat(all_pivots)
 
 # %%
-if not all_pivots.empty:
-    all_pivots.to_csv(f"snapshots.csv.gz",index=False)
-    print('Done')
+if all_pivots.empty:
+    print('No results')
+    quit()
+
+print('Post-processing and saving results as CSV...')
+final_keys = ['snapshot','cik','date']
+
+# After a certain date is repeated more than 12 snapshots, we assume the cik no longer files with the SEC.
+# We drop these records from the dataset, but we do not drop the corresponding enitre ciks,
+# because this does not represent a case of invalid data.
+defunct_ciks = all_pivots[['cik','date']].value_counts()
+defunct_ciks = defunct_ciks[defunct_ciks>12].to_frame().reset_index(drop=False)
+all_pivots = all_pivots.sort_values(by=final_keys).set_index(final_keys)
+defunct_keys_to_drop = pd.merge(all_pivots.index.to_frame(name=['s','c','d']), defunct_ciks.rename(columns={'cik':'c','date':'d'}), how='inner')
+defunct_keys_to_drop = pd.MultiIndex.from_frame(defunct_keys_to_drop.drop(columns=['count']),names=final_keys)
+all_pivots = all_pivots.drop(index=defunct_keys_to_drop)
+
+all_pivots.to_csv(f"snapshots.csv.gz",index=True)
+print('Done')
