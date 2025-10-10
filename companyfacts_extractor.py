@@ -40,7 +40,7 @@ tickers['cik'] = tickers['cik'].str.zfill(10)
 tickers['len'] = 4
 tickers.loc[tickers[tickers['ticker'].str.contains('-')].index,'len'] += 1
 tickers['ticker'] = tickers.apply(lambda row: str(row.ticker[:row.len]),axis='columns').str.rstrip().str.rstrip('-').str.upper()
-tickers = tickers.sort_values(by=['cik','exchange','ticker']).drop_duplicates(subset=['cik'],keep='last').set_index('cik').drop(columns=['len'])
+tickers = tickers.sort_values(by=['cik','exchange','ticker','len']).drop_duplicates(subset=['cik'],keep='first').set_index('cik').drop(columns=['len'])
 
 # %%
 # If you download the .zip file manually and put it in the same directory as this script,
