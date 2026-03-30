@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # %%
+import warnings
 import datetime
 import requests
 import io
@@ -7,7 +8,10 @@ import zipfile
 import pandas as pd
 import numpy as np
 import json
-import multiprocessing as mp
+import gc
+import itertools
+from joblib import Parallel, delayed, parallel_config, cpu_count
+warnings.filterwarnings("error")
 
 # %%
 # If you happen to use this program, please change the user-agent string, because if too many people start using
@@ -22,18 +26,30 @@ print("Total number of dates to create snapshots for:", len(dates_to_compute))
 export_additional_datasets = False
 
 # %%
-if __name__ == '__main__':
-    mp.set_start_method('fork')
-print('{} CPUs available'.format(mp.cpu_count()))
-#This script has been tested on a c2d-highmem-32 (32 vCPUs, 256 GB Memory) VM instance, where it runs for about 15 minutes with peak RAM usage of about 80%
-#In google cloud the above is the vCPU count. The actual CPU cores are half that. This also uses much less RAM
-max_jobs = mp.cpu_count() // 2 + 1
+# This script is memory-intensive. It needs 8GB of RAM per vCPU to finish successfully.
+max_jobs = cpu_count(only_physical_cores=False)
+print(f'{max_jobs} CPUs available')
+max_jobs = max_jobs + 1
 
 # %%
-r = requests.get('https://www.sec.gov/files/company_tickers_exchange.json', headers = sec_headers)
-r.raise_for_status()
-r = r.json()
-tickers = pd.DataFrame(columns=r['fields'],data=r['data'],dtype=str)
+def cached_fetch(sec_url):
+    sec_filename = sec_url.split('/')[-1]
+    try:
+        with open(sec_filename, mode='rb') as f:
+            print(f"{sec_filename} found locally, loading...")
+            req = f.read()
+    except:
+        print(f"{sec_filename} unavailable, downloading from SEC...")
+        req = requests.get(sec_url, headers = sec_headers)
+        req.raise_for_status()
+        req = req.content
+        print(f'{len(req)/2**30:.4f} gigibytes retrieved')
+    return req
+
+# %%
+tickers = cached_fetch('https://www.sec.gov/files/company_tickers_exchange.json')
+tickers = json.loads(tickers)
+tickers = pd.DataFrame(columns=tickers['fields'],data=tickers['data'],dtype=str)
 tickers = tickers[tickers['exchange']!='OTC'].dropna() #leave only tickers traded on an exchange
 tickers['exchange'] = tickers['exchange'].str.upper().str.strip()
 tickers['cik'] = tickers['cik'].str.zfill(10)
@@ -45,23 +61,11 @@ tickers = tickers.sort_values(by=['cik','exchange','ticker','len']).drop_duplica
 # %%
 # If you download the .zip file manually and put it in the same directory as this script,
 # we can use that to avoid repeated downloads of the same file.
-zip_filename = 'companyfacts.zip'
-companyfacts_df_keys = ['cik','schema','tag','end','start']
-try:
-    with open(zip_filename, mode='rb') as f:
-        print(f"{zip_filename} found locally, loading...")
-        r = f.read()
-except:
-    print(f"{zip_filename} unavailable, downloading from SEC...")
-    r = requests.get(f"https://www.sec.gov/Archives/edgar/daily-index/xbrl/{zip_filename}", headers = sec_headers)
-    r.raise_for_status()
-    r = r.content
-    print('{} gigibytes retrieved'.format(len(r)/2**30))
-
-# %%
-source_zip = zipfile.ZipFile(io.BytesIO(r), mode='r')
+source_zip = cached_fetch('https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip')
+source_zip = zipfile.ZipFile(io.BytesIO(source_zip), mode='r')
 all_files = source_zip.namelist()
 print('{} files in archive'.format(len(all_files)))
+companyfacts_df_keys = ['cik','schema','tag','end','start']
 
 # %%
 # We do data reduction here. There is a very large number of XBRL tags present in the zip file from the SEC.
@@ -70,7 +74,7 @@ def deconstruct_json(j):
     try:
         this_cik = str(j['cik']).zfill(10)
     except:
-        return
+        return pd.DataFrame()
 
     known_facts = [
         'Revenues',
@@ -115,6 +119,7 @@ def deconstruct_json(j):
         dei_facts = []
 
     all_facts = []
+
     for a_fact in known_facts + dei_facts:
         try:
             unit = 'shares' if 'Share' in a_fact else 'USD'
@@ -130,32 +135,26 @@ def deconstruct_json(j):
     return pd.DataFrame(all_facts) if all_facts else pd.DataFrame()
 
 # %%
-def convert_a_file(a_file):
+def open_a_json_file(a_file):
+    jfile = None
     try:
         with source_zip.open(a_file) as f:
             jfile = json.load(f)
     except:
         print("Error during opening of:", a_file)
-        return []
+    return deconstruct_json(jfile)
+
+# %%
+def make_companyfacts_df():
     try:
-        df = deconstruct_json(jfile)
+        df = pd.read_csv('companyfacts.csv.gz').drop(columns=['corrected','val_final'])
+        print('Using companyfacts dataset found locally.')
     except:
-        print("Error during processing of:", a_file)
-        return []
-    return df
-
-# %%
-if __name__ == '__main__':
-    with mp.Pool(processes=max_jobs) as p:
-        companyfacts = list(p.map(convert_a_file,all_files))
-print('A total of {} processed json files.'.format(len(companyfacts)))
-#Tell the garbage collector to remove > 1GB from memory
-del source_zip
-del r
-
-# %%
-def make_companyfacts_df(list_of_processed_files):
-    df = pd.concat(list_of_processed_files)
+        with parallel_config(backend='multiprocessing', n_jobs=max_jobs):
+            # Reading the zip file in parallel works only with the legacy multiprocessing backend.
+            list_of_processed_files = Parallel()(delayed(open_a_json_file)(i) for i in all_files)
+        print('A total of {} json files were processed.'.format(len(list_of_processed_files)))
+        df = pd.concat(list_of_processed_files)
     df['cik'] = df['cik'].astype(str).str.zfill(10)
     df['schema'] = df['schema'].astype(str)
     df['tag'] = df['tag'].astype(str)
@@ -168,22 +167,25 @@ def make_companyfacts_df(list_of_processed_files):
     # with later filings. For each cik/fact/period combination, we determine the final available filing, so that the latest and most correct
     # value is used.
     print(len(df[df.isna().any(axis='columns')]),"rows removed from the companyfacts dataset due to invalid data")
-    df = df.dropna()
-    final_values = df.sort_values(by=companyfacts_df_keys + ['filed','val']).drop_duplicates(subset=companyfacts_df_keys,keep='last')
+    df = df.dropna().sort_values(by=companyfacts_df_keys + ['filed','val'])
+    final_values = df.drop_duplicates(subset=companyfacts_df_keys,keep='last').drop(columns=['filed'])
     df = pd.merge(df,final_values,how='left',on=companyfacts_df_keys,suffixes=(None, '_final'))
     df['corrected'] = df['val'] != df['val_final']
-    df = df.sort_values(by=companyfacts_df_keys + ['filed','val_final']).reset_index(drop=True)
+    df = df.reset_index(drop=True)
     return df
-companyfacts = make_companyfacts_df(companyfacts)
+companyfacts = make_companyfacts_df()
+print(f"{companyfacts['cik'].nunique()} unique ciks fetched.")
 
 # %%
-def save_companyfacts(df, filename):
-    df.to_csv(filename, index=False)
-    print(f"{len(df['cik'].unique())} unique ciks fetched and saved to {filename}")
+# Tell the garbage collector to remove > 2GB from memory
+del source_zip
+gc.collect()
 
-if __name__ == '__main__' and export_additional_datasets:
-    print("Saving companyfacts dataset in a background process...")
-    mp.Process(target=save_companyfacts, args=(companyfacts, "companyfacts.csv.gz")).start()
+# %%
+if export_additional_datasets:
+    print("Saving companyfacts dataset...")
+    companyfacts.to_csv("companyfacts.csv.gz", index=False)
+    print('Done')
 
 # %%
 key_fields = ['cik','start','end']
@@ -205,7 +207,7 @@ def create_pivot(a_date):
               'EntityNumberOfEmployees'
             ]:
         if i not in pivot.columns:
-            pivot[i] = np.NaN
+            pivot[i] = np.nan
 
     def convert_to_column(df):
         lv_name = df.name
@@ -314,20 +316,24 @@ def process_single_pivot(input_pivot):
 
     # The data in the SEC file has been submitted as relevant for different period lengths, usually from 1 quarter to 1 year.
     # Here we convert all data to per-quarter data by subtracting earlier periods from the later, larger ones, which contain them.
-    preceding_rows_df = pd.merge(a_pivot[key_fields].reset_index(drop=False),
-                                 a_pivot[key_fields].reset_index(drop=False),
-                                how='outer',left_on='cik',right_on='cik',suffixes=('','_previous'))
-    preceding_rows_condition = (preceding_rows_df['index_previous']<preceding_rows_df['index'])
-    preceding_rows_condition = preceding_rows_condition & (preceding_rows_df['start_previous']>=preceding_rows_df['start'])
-    preceding_rows_condition = preceding_rows_condition & (preceding_rows_df['end_previous']<=preceding_rows_df['end'])
-    preceding_rows_df = preceding_rows_df[preceding_rows_condition]
+    index_projection = a_pivot[key_fields].reset_index(drop=False)
+    def chunk_merge(list_of_ciks):
+        pivot_cik_selection = index_projection[index_projection['cik'].isin(list_of_ciks)]
+        preceding_rows_chunk = pd.merge(pivot_cik_selection, pivot_cik_selection, how='outer', on=['cik'], suffixes=('','_previous'))
+        preceding_rows_condition = (preceding_rows_chunk['index_previous']<preceding_rows_chunk['index'])
+        preceding_rows_condition = preceding_rows_condition & (preceding_rows_chunk['start_previous']>=preceding_rows_chunk['start'])
+        preceding_rows_condition = preceding_rows_condition & (preceding_rows_chunk['end_previous']<=preceding_rows_chunk['end'])
+        return preceding_rows_chunk[preceding_rows_condition]
+
+    preceding_rows_df = pd.concat(map(chunk_merge, itertools.batched(index_projection['cik'].unique().tolist(), 500)))
     preceding_rows_df = preceding_rows_df.groupby(by='index')['index_previous'].apply(lambda x:x.to_list())
     preceding_rows_df = preceding_rows_df.sort_index()
 
     numpy_df = a_pivot.iloc[:,column_indexes].to_numpy()
     for i,preceding_row_indexes in preceding_rows_df.items():
         numpy_df[i] -= np.nansum(numpy_df[preceding_row_indexes],axis=0)
-    a_pivot.iloc[:,column_indexes] = numpy_df
+    new_contents_df = pd.DataFrame(data=numpy_df, columns=a_pivot.columns[column_indexes], index=a_pivot.index)
+    a_pivot[new_contents_df.columns.to_list()] = new_contents_df
 
     a_pivot = a_pivot.rename(columns={'end':'date'}).sort_values(by=['date','start'])
     a_pivot = a_pivot.drop(columns=['start']).groupby(by=['cik','date']).mean()
@@ -369,25 +375,21 @@ def process_single_pivot(input_pivot):
     return df_finished
 
 # %%
-if __name__ == '__main__':
+with parallel_config(backend='multiprocessing', n_jobs=max_jobs):
+    # Once again, the legacy backend works much better
     print("Creating pivots...")
-    with mp.Pool(processes=max_jobs) as p:
-        all_pivots = list(p.map(create_pivot,dates_to_compute))
+    all_pivots = Parallel()(delayed(create_pivot)(i) for i in dates_to_compute)
+    print("Creating snapshots...")
+    all_pivots = Parallel()(delayed(process_single_pivot)(i) for i in all_pivots)
 
 # %%
-if __name__ == '__main__':
-    print("Creating snapshots...")
-    with mp.Pool(processes=max_jobs) as p:
-        all_pivots = list(p.map(process_single_pivot,all_pivots))
-
 print('Building dataset...')
 all_pivots = pd.concat(all_pivots)
-
-# %%
 if all_pivots.empty:
     print('No results')
     quit()
 
+# %%
 print('Post-processing and saving results as CSV...')
 final_keys = ['snapshot','cik','date']
 
