@@ -28,8 +28,7 @@ export_additional_datasets = False
 # %%
 # This script is memory-intensive. It needs 8GB of RAM per vCPU to finish successfully.
 max_jobs = cpu_count(only_physical_cores=False)
-print(f'{max_jobs} CPUs available')
-max_jobs = max_jobs + 1
+print(f'Will use {max_jobs} parallel jobs, you should have at least {max(3,max_jobs)*8} GiB of RAM.')
 
 # %%
 def cached_fetch(sec_url):
