@@ -1,406 +1,574 @@
 #!/usr/bin/env python3
 # %%
-import warnings
-import datetime
-import requests
-import io
-import zipfile
+from contextlib import redirect_stdout
+import os, sys, warnings, io, gc, argparse
+import cProfile, pstats
+import zipfile, json, itertools
+import datetime, re
 import pandas as pd
 import numpy as np
-import json
-import gc
-import itertools
+from numba import njit
 from joblib import Parallel, delayed, parallel_config, cpu_count
-warnings.filterwarnings("error")
+warnings.filterwarnings("error")  #Enforce a kind of a 'strict' mode.
 
 # %%
-# If you happen to use this program, please change the user-agent string, because if too many people start using
-# the same user-agent, the SEC will finally block it due to excessive usage
-sec_headers = {'User-Agent':'Your Name your.email.here@example.org','Accept-Encoding':'gzip, deflate'}
-today = datetime.datetime.today().date()
-dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2012,today.year+1)) for month in list(range(1,13)) ]
-dates_to_compute = [ i for i in dates_to_compute if i < today ]
-#dates_to_compute = dates_to_compute[:1]  #Uncomment this for test purposes
-dates_to_compute.append(today)
-print("Total number of dates to create snapshots for:", len(dates_to_compute))
-export_additional_datasets = False
+def parse_arguments():
+
+    description = """
+    Reduce a SEC bulk financial data companyfacts.zip file to a time-series CSV.
+    This zip file is freely downloadable from the following web page of
+    the United States Securities and Exchange Commission:
+    https://www.sec.gov/search-filings/edgar-application-programming-interfaces
+
+    The input .zip binary must be provided on the standard input.
+    The output CSV is written as utf-8 plain text to the standard output.
+    All status messages are logged to stderr only.
+
+    If a company_tickers_exchange.json file is found in the working directory,
+    it will be used to populate the output dataset with the corresponding stock
+    exchange names and ticker symbols of the SEC cik IDs present in the output CSV.
+    This file is also freely downloadable from the following SEC link:
+    https://www.sec.gov/files/company_tickers_exchange.json
+
+    This program utilizes multiprocessing via the legacy backend of python's
+    joblib module. Therefore, unless explicitly switched off, such kind of parallelism
+    may prevent the program from running correctly in some container environments.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        "--max-jobs", "-j",
+        type=int,
+        default=-1,
+        help="Number of jobs to run in parallel. Setting this to 1 disables multiprocessing and enables profiling. Default is -1 (use all CPU cores/threads)."
+    )
+
+    parser.add_argument(
+        "--partial-dataset", "-p",
+        action="store_true",
+        help="Process only a small subset of the data for debugging or profiling purposes."
+    )
+
+    parser.add_argument(
+        "--dump-intermediate-stages", "-d",
+        action="store_true",
+        help="Save the intermediate companyfacts CSV dataset and the individual snapshot pivots to the current working directory."
+    )
+
+    args = parser.parse_args()
+    if args.max_jobs < 1:
+        args.max_jobs = -1
+    args.vCPUs = cpu_count(only_physical_cores=False) if args.max_jobs < 1 else args.max_jobs
+
+    return args
 
 # %%
-# This script is memory-intensive. It needs 8GB of RAM per vCPU to finish successfully.
-max_jobs = cpu_count(only_physical_cores=False)
-print(f'Will use {max_jobs} parallel jobs, you should have at least {max(3,max_jobs)*8} GiB of RAM.')
-
-# %%
-def cached_fetch(sec_url):
-    sec_filename = sec_url.split('/')[-1]
-    try:
-        with open(sec_filename, mode='rb') as f:
-            print(f"{sec_filename} found locally, loading...")
-            req = f.read()
-    except:
-        print(f"{sec_filename} unavailable, downloading from SEC...")
-        req = requests.get(sec_url, headers = sec_headers)
-        req.raise_for_status()
-        req = req.content
-        print(f'{len(req)/2**30:.4f} gigibytes retrieved')
-    return req
-
-# %%
-tickers = cached_fetch('https://www.sec.gov/files/company_tickers_exchange.json')
-tickers = json.loads(tickers)
-tickers = pd.DataFrame(columns=tickers['fields'],data=tickers['data'],dtype=str)
-tickers = tickers[tickers['exchange']!='OTC'].dropna() #leave only tickers traded on an exchange
-tickers['exchange'] = tickers['exchange'].str.upper().str.strip()
-tickers['cik'] = tickers['cik'].str.zfill(10)
-tickers['len'] = 4
-tickers.loc[tickers[tickers['ticker'].str.contains('-')].index,'len'] += 1
-tickers['ticker'] = tickers.apply(lambda row: str(row.ticker[:row.len]),axis='columns').str.rstrip().str.rstrip('-').str.upper()
-tickers = tickers.sort_values(by=['cik','exchange','ticker','len']).drop_duplicates(subset=['cik'],keep='first').set_index('cik').drop(columns=['len'])
-
-# %%
-# If you download the .zip file manually and put it in the same directory as this script,
-# we can use that to avoid repeated downloads of the same file.
-source_zip = cached_fetch('https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip')
-source_zip = zipfile.ZipFile(io.BytesIO(source_zip), mode='r')
-all_files = source_zip.namelist()
-print('{} files in archive'.format(len(all_files)))
-companyfacts_df_keys = ['cik','schema','tag','end','start']
-
-# %%
-# We do data reduction here. There is a very large number of XBRL tags present in the zip file from the SEC.
+# There is a very large number of XBRL tags present in the zip file from the SEC.
 # We are only interested in a few of them, that will be used to construct the end results.
-def deconstruct_json(j):
-    try:
-        this_cik = str(j['cik']).zfill(10)
-    except:
-        return pd.DataFrame()
+known_facts = [
+    'dei.EntityCommonStockSharesOutstanding.shares',
+    'dei.EntityNumberOfEmployees.person',
+    'dei.EntityPublicFloat.usd',
+    'us-gaap.AssetsCurrent.usd',
+    'us-gaap.AssetsNoncurrent.usd',
+    'us-gaap.Assets.usd',
+    'us-gaap.CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations.usd',
+    'us-gaap.CostOfGoodsAndServicesSold.usd',
+    'us-gaap.CostOfGoodsSold.usd',
+    'us-gaap.CostOfRevenue.usd',
+    'us-gaap.CostOfServices.usd',
+    'us-gaap.GrossProfit.usd',
+    'us-gaap.InterestAndDividendIncomeOperating.usd',
+    'us-gaap.InterestAndFeeIncomeLoansAndLeases.usd',
+    'us-gaap.LiabilitiesAndStockholdersEquity.usd',
+    'us-gaap.NetCashProvidedByUsedInFinancingActivitiesContinuingOperations.usd',
+    'us-gaap.NetCashProvidedByUsedInFinancingActivities.usd',
+    'us-gaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations.usd',
+    'us-gaap.NetCashProvidedByUsedInOperatingActivities.usd',
+    'us-gaap.NetIncomeLossAttributableToNoncontrollingInterest.usd',
+    'us-gaap.NetIncomeLossAvailableToCommonStockholdersBasic.usd',
+    'us-gaap.NetIncomeLoss.usd',
+    'us-gaap.NoninterestIncome.usd',
+    'us-gaap.OtherIncome.usd',
+    'us-gaap.OtherSalesRevenueNet.usd',
+    'us-gaap.ProfitLoss.usd',
+    'us-gaap.RevenueFromContractWithCustomerExcludingAssessedTax.usd',
+    'us-gaap.RevenueFromContractWithCustomerIncludingAssessedTax.usd',
+    'us-gaap.Revenues.usd',
+    'us-gaap.SalesRevenueGoodsNet.usd',
+    'us-gaap.SalesRevenueNet.usd',
+    'us-gaap.SalesRevenueServicesNet.usd',
+    'us-gaap.StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest.usd',
+    'us-gaap.StockholdersEquity.usd',
+    'us-gaap.WeightedAverageNumberOfDilutedSharesOutstanding.shares',
+    'us-gaap.WeightedAverageNumberOfShareOutstandingBasicAndDiluted.shares',
+    'us-gaap.WeightedAverageNumberOfSharesOutstandingBasic.shares'
+]
 
-    known_facts = [
-        'Revenues',
-        'SalesRevenueNet',
-        'SalesRevenueGoodsNet',
-        'SalesRevenueServicesNet',
-        'OtherSalesRevenueNet',
-        'RevenueFromContractWithCustomerExcludingAssessedTax',
-        'RevenueFromContractWithCustomerIncludingAssessedTax',
-        'InterestAndDividendIncomeOperating',
-        'InterestAndFeeIncomeLoansAndLeases',
-        'NoninterestIncome',
-        'OtherIncome',
-        'CostOfRevenue',
-        'CostOfGoodsAndServicesSold',
-        'CostOfGoodsSold',
-        'CostOfServices',
-        'GrossProfit',
-        'Assets',
-        'LiabilitiesAndStockholdersEquity',
-        'AssetsCurrent',
-        'AssetsNoncurrent',
-        'StockholdersEquity',
-        'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
-        'NetCashProvidedByUsedInOperatingActivities',
-        'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
-        'CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations',
-        'NetCashProvidedByUsedInFinancingActivities',
-        'NetCashProvidedByUsedInFinancingActivitiesContinuingOperations',
-        'NetIncomeLoss',
-        'ProfitLoss',
-        'NetIncomeLossAttributableToNoncontrollingInterest',
-        'NetIncomeLossAvailableToCommonStockholdersBasic',
-        'WeightedAverageNumberOfShareOutstandingBasicAndDiluted',
-        'WeightedAverageNumberOfDilutedSharesOutstanding',
-        'WeightedAverageNumberOfSharesOutstandingBasic'
-    ]
+# Enforce consistency of the output CSV structure to not break applications that use the resulting dataset.
+# If new columns are introduced, they will be appended to the end of this list.
+export_schema = [
+    'snapshot',
+    'cik',
+    'date',
+    'Assets',
+    'Revenue',
+    'COGS',
+    'GrossProfit',
+    'Equity',
+    'NetCashOperating',
+    'NetCashFinancing',
+    'Earnings',
+    'Shares',
+    'Liabilities',
+    'Revenue_ttm',
+    'GrossProfit_ttm',
+    'NetCashOperating_ttm',
+    'NetCashFinancing_ttm',
+    'Earnings_ttm',
+    'ticker',
+    'exchange',
+    'PublicFloat',
+    'Employees'
+]
 
-    try:
-        dei_facts = list(j['facts']['dei'].keys())
-    except:
-        dei_facts = []
+# %%
+def dump_memory_usage(note=None,top_n=5):
+    sizes = sorted([round(sys.getsizeof(obj)/2**30,3) for obj in gc.get_objects()],reverse=True)[:top_n]
+    print(f"{note}:" if note is not None else '',
+          f"{round(sum(sizes),1)}GiB used by the top {top_n} memory objects:", sizes, file=sys.stderr)
 
-    all_facts = []
+# %%
+# We do data reduction here, because we do not need most of the json content
+def parse_a_json_dict(jdict):
+    # Basic sanity checks for the json contents. These checks fail with a KeyError
+    cik = str(jdict['cik']).zfill(10)  #A cik must be present
+    if not len(jdict['facts']['us-gaap'].keys()) >= 2:  #At least this many distinct facts must be present
+        raise KeyError('No actual data found in json file.')
 
-    for a_fact in known_facts + dei_facts:
+    j = list()
+    for fact_path in known_facts:
+        taxonomy, fact, wanted_units = fact_path.split('.')
+        wanted_units = [ wanted_units.lower() ]
+        if 'person' in wanted_units:
+            wanted_units += ['employ','colleague','staff','count','item' ]
+        # Test if the wanted unit(s) like USD, shares and people, are present in the json data for the current taxonomy fact.
         try:
-            unit = 'shares' if 'Share' in a_fact else 'USD'
-            schema = 'dei' if a_fact in dei_facts else 'us-gaap'
-            a_fact_table = j['facts'][schema][a_fact]['units'][unit] if a_fact in dei_facts else j['facts'][schema][a_fact]['units'][unit]
-            for i in range(0,len(a_fact_table)):
-                for unwanted_column in ['accn','fy','fp','form','frame']:
-                    a_fact_table[i].pop(unwanted_column,None)
-            a_fact_table = [ {'cik':this_cik,'schema':schema,'tag':a_fact, **a_tab_line } for a_tab_line in a_fact_table]
-            all_facts += a_fact_table
+            wanted_units = [ a_unit for a_unit in jdict['facts'][taxonomy][fact]['units'].keys() if a_unit.lower() in wanted_units ]
         except:
-            pass
-    return pd.DataFrame(all_facts) if all_facts else pd.DataFrame()
+            continue
+        # Use the first unit found which contans data
+        for a_unit in wanted_units:
+            fact_data = jdict['facts'][taxonomy][fact]['units'][a_unit]
+            if fact_data:
+                j += list(map(lambda x:x | {'cik': cik, 'fact': fact_path }, fact_data))
+                break
+    return j
 
 # %%
-def open_a_json_file(a_file):
-    jfile = None
-    try:
-        with source_zip.open(a_file) as f:
-            jfile = json.load(f)
-    except:
-        print("Error during opening of:", a_file)
-    return deconstruct_json(jfile)
+def batch_convert_json(list_of_json_files):
+    df = pd.DataFrame() #Always return a DataFrame for easier post-procesing
+    parsed_data = list()
+    strip_unneeded = re.compile(r',"(accn|fp|form|frame)":"[^"]*"') # Data reduction => less RAM needed downstream. A modest speedup, too.
+    for jfile in list_of_json_files:
+        try:
+            jfile = json.loads(strip_unneeded.sub('',jfile.decode('utf-8')))
+        except json.JSONDecodeError as err:
+            context_before = 20
+            context_after = 20
+            with redirect_stdout(sys.stderr):
+                print('JSON error:',err)
+                print('JSON file begins with:',jfile[:60]) #Dump the cik
+                print('Error location:', err.doc[err.pos-context_before:err.pos+context_after])
+                try:
+                    index_in_original = jfile.index(err.doc[err.pos-context_before:err.pos])
+                    print('Original context:', jfile[index_in_original:index_in_original+context_before+context_after])
+                except:
+                    pass
+            sys.exit(1)
+        try:
+            parsed_data += parse_a_json_dict(jfile)
+        except KeyError:
+            pass #A valid json file without financial data is not an error. Silently skipping...
 
-# %%
-def make_companyfacts_df():
-    try:
-        df = pd.read_csv('companyfacts.csv.gz').drop(columns=['corrected','val_final'])
-        print('Using companyfacts dataset found locally.')
-    except:
-        with parallel_config(backend='multiprocessing', n_jobs=max_jobs):
-            # Reading the zip file in parallel works only with the legacy multiprocessing backend.
-            list_of_processed_files = Parallel()(delayed(open_a_json_file)(i) for i in all_files)
-        print('A total of {} json files were processed.'.format(len(list_of_processed_files)))
-        df = pd.concat(list_of_processed_files)
-    df['cik'] = df['cik'].astype(str).str.zfill(10)
-    df['schema'] = df['schema'].astype(str)
-    df['tag'] = df['tag'].astype(str)
-    df['start'] = df['start'].combine_first(df['end'])
-    df['end'] = pd.to_datetime(df['end'],yearfirst=True,errors='coerce').dt.date
-    df['start'] = pd.to_datetime(df['start'],yearfirst=True,errors='coerce').dt.date
-    df['filed'] = pd.to_datetime(df['filed'],yearfirst=True,errors='coerce').dt.date
-    df['val'] = pd.to_numeric(df['val'],errors='coerce').astype(float)
-    # Many companies have submitted wrong or invalid values during the years. Most of these invalid values have been corrected eventually
-    # with later filings. For each cik/fact/period combination, we determine the final available filing, so that the latest and most correct
-    # value is used.
-    print(len(df[df.isna().any(axis='columns')]),"rows removed from the companyfacts dataset due to invalid data")
-    df = df.dropna().sort_values(by=companyfacts_df_keys + ['filed','val'])
-    final_values = df.drop_duplicates(subset=companyfacts_df_keys,keep='last').drop(columns=['filed'])
-    df = pd.merge(df,final_values,how='left',on=companyfacts_df_keys,suffixes=(None, '_final'))
-    df['corrected'] = df['val'] != df['val_final']
-    df = df.reset_index(drop=True)
-    return df
-companyfacts = make_companyfacts_df()
-print(f"{companyfacts['cik'].nunique()} unique ciks fetched.")
+    if parsed_data:
+        df = pd.DataFrame(parsed_data)
+        # For some facts the start date is not given, but the downstream logic depends on it.
+        if 'start' not in df.columns:
+            df['start'] = df['end']
+        else:
+            df['start'] = df['start'].combine_first(df['end'])
+        data_column_names = ['filed','cik','end','start','fact','val'] #There are other columns in the data we do not need
+        df = df[data_column_names].dropna() #Drop the few facts that are present, but have no value
 
-# %%
-# Tell the garbage collector to remove > 2GB from memory
-del source_zip
-gc.collect()
+    if not df.empty:
+        # Sanitize the datatypes
+        for a_date_column in ['start','end','filed']:
+            df[a_date_column] = pd.to_datetime(df[a_date_column], yearfirst=True, errors='coerce')
+        df['val'] = pd.to_numeric(df['val'], errors='coerce')
+        # We treat all columns except 'val' as key. They should generally be unique, because a company should not report twice per day
+        # divergent values for the same fact. We do aggregate here along the key however, just in case this is not true.
+        df = df.groupby(by=data_column_names[:-1])['val'].max().reset_index(drop=False)
+        # Many companies have submitted wrong or invalid values during the years. Most of these invalid values have been corrected eventually
+        # with later filings. For each cik/period/fact combination, we determine the final available filing, so that the latest and most correct
+        # value is used.
+        final_values = df.drop_duplicates(subset=data_column_names[1:-1],keep='last').set_index(data_column_names[1:-1]).drop(columns='filed')
+        df = df.set_index(data_column_names[:-1]) #With "filed"
+        df = df.merge(final_values,left_index=True,right_index=True,suffixes=(None, '_final'))
+        df['corrected'] = df['val'] != df['val_final']
 
-# %%
-if export_additional_datasets:
-    print("Saving companyfacts dataset...")
-    companyfacts.to_csv("companyfacts.csv.gz", index=False)
-    print('Done')
-
-# %%
-key_fields = ['cik','start','end']
-
-# %%
-# Here we read the entire companyfacts dataframe and remove all data, filed after the given cut-off date.
-# This is the main business logic of this dataset, which views the SEC data as a series of snapshots,
-# which contain the data, known to the markets, at a given date. The remaining data in the form of XBRL tags
-# is combined into new columns, which carry the final meaning of the business data.
-def create_pivot(a_date):
-    pivot = companyfacts[companyfacts['filed'] < a_date]
-    pivot = pivot.drop_duplicates(subset=companyfacts_df_keys,keep='last')
-    pivot = pd.pivot_table(pivot,values='val_final', index=key_fields, columns='tag', aggfunc='sum').sort_index()
-
-    #Some tags were introduced later during the years and for earlier snapshots we must add them manually to avoid KeyErrors
-    for i in ['RevenueFromContractWithCustomerExcludingAssessedTax',
-              'RevenueFromContractWithCustomerIncludingAssessedTax',
-              'WeightedAverageNumberOfShareOutstandingBasicAndDiluted',
-              'EntityNumberOfEmployees'
-            ]:
-        if i not in pivot.columns:
-            pivot[i] = np.nan
-
-    def convert_to_column(df):
-        lv_name = df.name
-        df = df.reset_index().set_index(key_fields)
-        df = df.rename(columns={df.columns[0]:lv_name})
-        return df
-
-    revenue = pivot['Revenues'].combine_first(
-        pivot['SalesRevenueNet']).combine_first(
-        pivot[['SalesRevenueGoodsNet',
-               'SalesRevenueServicesNet',
-               'OtherSalesRevenueNet']].sum(min_count=1,axis='columns')).combine_first(
-        pivot['RevenueFromContractWithCustomerExcludingAssessedTax']).combine_first(
-        pivot['RevenueFromContractWithCustomerIncludingAssessedTax']).combine_first(
-        pivot[['InterestAndDividendIncomeOperating',
-               'InterestAndFeeIncomeLoansAndLeases',
-               'NoninterestIncome',
-               'OtherIncome']].sum(min_count=1,axis='columns'))
-    revenue.name = 'Revenue'
-    revenue = convert_to_column(revenue)
-    
-    cogs = pivot['CostOfRevenue'].combine_first(
-        pivot['CostOfGoodsAndServicesSold']).combine_first(
-        pivot[['CostOfGoodsSold',
-               'CostOfServices']].sum(min_count=1,axis='columns'))
-    cogs.name = 'COGS'
-    cogs = convert_to_column(cogs)
-    
-    gross_profit = pivot['GrossProfit']
-    gross_profit.name = 'GrossProfit'
-    gross_profit = convert_to_column(gross_profit)
-    
-    assets = pivot['Assets'].combine_first(
-        pivot['LiabilitiesAndStockholdersEquity']).combine_first(
-        pivot[['AssetsCurrent',
-               'AssetsNoncurrent'
-        ]].sum(min_count=1,axis='columns'))
-    assets.name = 'Assets'
-    assets = convert_to_column(assets)
-    
-    equity = pivot['StockholdersEquity'].combine_first(
-        pivot['StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'])
-    equity.name = 'Equity'
-    equity = convert_to_column(equity)
-        
-    net_cash_operating = pivot['NetCashProvidedByUsedInOperatingActivities'].combine_first(
-        pivot[['NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
-               'CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations'
-        ]].sum(min_count=1,axis='columns'))
-    net_cash_operating.name = 'NetCashOperating'
-    net_cash_operating = convert_to_column(net_cash_operating)
-    
-    net_cash_financing = pivot['NetCashProvidedByUsedInFinancingActivities'].combine_first(
-        pivot['NetCashProvidedByUsedInFinancingActivitiesContinuingOperations'])
-    net_cash_financing.name = 'NetCashFinancing'
-    net_cash_financing = convert_to_column(net_cash_financing)
-
-    earnings = pivot['NetIncomeLoss'].combine_first(
-        pivot['ProfitLoss']).combine_first(
-        pivot['NetIncomeLossAttributableToNoncontrollingInterest']).combine_first(
-        pivot['NetIncomeLossAvailableToCommonStockholdersBasic'])
-    earnings.name = 'Earnings'
-    earnings = convert_to_column(earnings)
-
-    shares = pivot['WeightedAverageNumberOfShareOutstandingBasicAndDiluted'].combine_first(
-        pivot['WeightedAverageNumberOfDilutedSharesOutstanding']).combine_first(
-        pivot['WeightedAverageNumberOfSharesOutstandingBasic'])
-    shares.name = 'Shares'
-    shares = convert_to_column(shares)
-    
-    new_columns = [assets, revenue, cogs, gross_profit, equity, net_cash_operating, net_cash_financing, earnings, shares]
-    new_columns = pd.concat(new_columns,axis='columns').reset_index(drop=False)
-    new_columns = new_columns.sort_values(by=key_fields)
-
-    df_dei = pivot.groupby(by='cik')[['EntityCommonStockSharesOutstanding','EntityPublicFloat','EntityNumberOfEmployees']].last().reset_index(drop=False)
-    df_dei = df_dei.rename(columns={'EntityCommonStockSharesOutstanding':'EntityShares','EntityPublicFloat':'PublicFloat','EntityNumberOfEmployees':'Employees'})
-
-    print(f"Pivot for date {a_date} created.")
-    return a_date, new_columns, df_dei
-
-# %%
-# Here we mostly compute trailing-twelve-month values out of the per-quarter values. This can only be done on a 
-# cik-per-cik basis.
-def per_cik_conversions(a_group):
-    a_cik, df = a_group
-
-    tags_to_ttm = ['Revenue', 'GrossProfit', 'NetCashOperating', 'NetCashFinancing', 'Earnings']
-    ttm = df[tags_to_ttm].rolling(window=4).sum().rename(columns={ i:f"{i}_ttm" for i in tags_to_ttm })
-    df = pd.concat([df,ttm],axis='columns')
-
-    try:
-        a_ticker = tickers.loc[a_cik]
-    except:
-        a_ticker = None
-    
-    df['ticker'] = a_ticker['ticker'] if a_ticker is not None else ''
-    df['exchange'] = a_ticker['exchange'] if a_ticker is not None else ''
-    
     return df
 
 # %%
-def process_single_pivot(input_pivot):
-    a_date, a_pivot, df_dei = input_pivot
+def make_companyfacts(args, batch_size = 1000):
+    # Here the list of files can be restricted for test and debugging purposes,
+    # because the whole zip is large and takes time to process.
+    debugging_slice = slice(None) if not args.partial_dataset else slice(0,2000)
 
-    column_indexes = [a_pivot.columns.get_loc(x) for x in a_pivot.columns.to_list() if x not in key_fields + ['Shares']]
+    # Load the SEC zip file from standard input
+    print("Reading standard input...")
+    source_zip = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()), mode='r')
+    files_to_parse = source_zip.namelist()[debugging_slice]
+    print(f'Parsing {len(files_to_parse)} json files in batches of {batch_size}...')
+
+    job_results = pd.DataFrame()
+
+    current_batch = 0
+    unzip_generator = (source_zip.read(a_file) for a_file in files_to_parse)
+    for a_batch in itertools.batched(unzip_generator, batch_size):
+        job_results = pd.concat([job_results] + Parallel()(delayed(batch_convert_json)([i]) for i in a_batch))
+        current_batch += 1
+        dump_memory_usage(f'Batch {current_batch} of json files completed')
+    print(f'Financial data for {job_results.index.get_level_values("cik").nunique()} ciks was extracted.')
+    source_zip.close()
+
+    return job_results
+
+# %%
+# The individual XBRL tags are combined into new columns, which carry the final business meaning.
+def merge_facts(pivot):
+
+    # Some facts were introduced later during the years and for earlier snapshots
+    # we must add them manually to avoid KeyErrors
+    missing_facts = set(known_facts).difference(pivot.columns.to_list())
+    for a_missing_fact in missing_facts:
+        pivot[a_missing_fact] = np.nan
+
+    def combine_columns(df):
+        return df.sum(min_count=1, axis='columns')
+
+    new_columns = list()
+
+    new_columns.append(
+        pivot['us-gaap.Assets.usd'].combine_first(
+        pivot['us-gaap.LiabilitiesAndStockholdersEquity.usd']).combine_first(combine_columns(
+        pivot[['us-gaap.AssetsCurrent.usd',
+               'us-gaap.AssetsNoncurrent.usd',
+        ]])
+    ).rename('Assets'))
+
+    new_columns.append(
+        pivot['us-gaap.Revenues.usd'].combine_first(
+        pivot['us-gaap.SalesRevenueNet.usd']).combine_first(combine_columns(
+        pivot[['us-gaap.SalesRevenueGoodsNet.usd',
+               'us-gaap.SalesRevenueServicesNet.usd',
+               'us-gaap.OtherSalesRevenueNet.usd']])).combine_first(
+        pivot['us-gaap.RevenueFromContractWithCustomerExcludingAssessedTax.usd']).combine_first(
+        pivot['us-gaap.RevenueFromContractWithCustomerIncludingAssessedTax.usd']).combine_first(combine_columns(
+        pivot[['us-gaap.InterestAndDividendIncomeOperating.usd',
+               'us-gaap.InterestAndFeeIncomeLoansAndLeases.usd',
+               'us-gaap.NoninterestIncome.usd',
+               'us-gaap.OtherIncome.usd']])
+    ).rename('Revenue'))
+
+    new_columns.append(
+        pivot['us-gaap.CostOfRevenue.usd'].combine_first(
+        pivot['us-gaap.CostOfGoodsAndServicesSold.usd']).combine_first(combine_columns(
+        pivot[['us-gaap.CostOfGoodsSold.usd',
+               'us-gaap.CostOfServices.usd']])
+    ).rename('COGS'))
+
+    new_columns.append(
+        pivot['us-gaap.GrossProfit.usd'].rename('GrossProfit'))
+
+    new_columns.append(
+        pivot['us-gaap.StockholdersEquity.usd'].combine_first(
+        pivot['us-gaap.StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest.usd']
+    ).rename('Equity'))
+
+    new_columns.append(
+        pivot['us-gaap.NetCashProvidedByUsedInOperatingActivities.usd'].combine_first(combine_columns(
+        pivot[['us-gaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations.usd',
+               'us-gaap.CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations.usd'
+        ]])
+    ).rename('NetCashOperating'))
+
+    new_columns.append(
+        pivot['us-gaap.NetCashProvidedByUsedInFinancingActivities.usd'].combine_first(
+        pivot['us-gaap.NetCashProvidedByUsedInFinancingActivitiesContinuingOperations.usd']
+    ).rename('NetCashFinancing'))
+
+    new_columns.append(
+        pivot['us-gaap.NetIncomeLoss.usd'].combine_first(
+        pivot['us-gaap.ProfitLoss.usd']).combine_first(
+        pivot['us-gaap.NetIncomeLossAttributableToNoncontrollingInterest.usd']).combine_first(
+        pivot['us-gaap.NetIncomeLossAvailableToCommonStockholdersBasic.usd']
+    ).rename('Earnings'))
+
+    new_columns.append(
+        pivot['us-gaap.WeightedAverageNumberOfShareOutstandingBasicAndDiluted.shares'].combine_first(
+        pivot['us-gaap.WeightedAverageNumberOfDilutedSharesOutstanding.shares']).combine_first(
+        pivot['us-gaap.WeightedAverageNumberOfSharesOutstandingBasic.shares']
+    ).rename('Shares'))
+
+    new_columns.append(
+        pivot['dei.EntityCommonStockSharesOutstanding.shares'].rename('EntityShares'))
+
+    new_columns.append(
+        pivot['dei.EntityPublicFloat.usd'].rename('PublicFloat'))
+
+    new_columns.append(
+        pivot['dei.EntityNumberOfEmployees.person'].rename('Employees'))
+
+    new_columns = pd.concat(new_columns, axis='columns')
+
+    return new_columns
+
+# %%
+def enrich_with_tickers(snapshots, tickers_info):
+    if tickers_info is None:
+        snapshots['ticker'] = ''
+        snapshots['exchange'] = ''
+        return snapshots
+    return snapshots.merge(tickers_info[['ticker','exchange']],how='left',left_index=True,right_index=True)
+
+# %%
+# Numba is the speed king :-)
+@njit
+def scan_periods(input_arr, output_arr):
+    start, end = (1,2) #indexes of the period start and period end columns for both input and output arrays.
+    return_length_only = len(output_arr.shape) <= 1
+    actual_length = 0
+    for i in np.arange(1, input_arr.shape[0]):
+        this_period = input_arr[i]
+        # Here we enforce the following logic:
+        # index_earlier_period < index
+        earlier_periods = input_arr[:i]
+        # start_earlier_period >= start
+        # end_earlier_period <= end
+        earlier_periods = earlier_periods[(earlier_periods[:,start] >= this_period[start])&(earlier_periods[:,end] <= this_period[end])]
+        remaining_length = earlier_periods.shape[0]
+        if remaining_length < 1:
+            continue
+        # we do broadcasting, so that this period is in the second column (index 1)
+        earlier_periods[:,1] = this_period[0]
+        if not return_length_only:
+            output_arr[actual_length:actual_length+remaining_length] = earlier_periods[:,:2]
+        actual_length += remaining_length
+    if return_length_only:
+        output_arr[0] = actual_length
+    return output_arr
+
+# For all its raw speed, numba is best suited to work on numpy arrays that already exist and do not change shape.
+# Therefore, here we implement a 2-pass logic: first pass to determine the shape of the output and a second
+# pass to fill an output array with data.
+def get_earlier_period_indexes(n):
+    output_length = scan_periods(n, np.array([0]))[0]
+    # We flip the output columns, so that the current period indexes are first. The downstream logic depends on this.
+    return scan_periods(n, np.empty(shape=(output_length,2),dtype=n.dtype))[:,[1,0]] #<-the flip
+
+# %%
+def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
+    # We need a new order of the keys, so that sorting along them will make possible the do_subtract logic below.
+    a_pivot = a_pivot.reorder_levels(['cik','fact','start','end','filed']).sort_index().droplevel('filed', axis='index')
+    a_pivot = a_pivot[~a_pivot.index.duplicated(keep='last')].unstack(level='fact').droplevel(0, axis='columns')
+    # The index loses its sort order from above after the unstack operation.
+    # This breaks the logic below, so here we explicitly sort the index again.
+    a_pivot.sort_index(inplace=True,ascending=True)
+    # The dei facts are almost always reported for dates unlike those for us-gaap facts. Thus, they require special treatment.
+    # We save these columns for later.
+    dei_facts = a_pivot.filter(regex=r'^dei\.Entity', axis='columns').copy()
+    # Combine the individual fact columns into aggregate columns.
+    a_pivot = merge_facts(a_pivot)
 
     # The data in the SEC file has been submitted as relevant for different period lengths, usually from 1 quarter to 1 year.
     # Here we convert all data to per-quarter data by subtracting earlier periods from the later, larger ones, which contain them.
-    index_projection = a_pivot[key_fields].reset_index(drop=False)
-    def chunk_merge(list_of_ciks):
-        pivot_cik_selection = index_projection[index_projection['cik'].isin(list_of_ciks)]
-        preceding_rows_chunk = pd.merge(pivot_cik_selection, pivot_cik_selection, how='outer', on=['cik'], suffixes=('','_previous'))
-        preceding_rows_condition = (preceding_rows_chunk['index_previous']<preceding_rows_chunk['index'])
-        preceding_rows_condition = preceding_rows_condition & (preceding_rows_chunk['start_previous']>=preceding_rows_chunk['start'])
-        preceding_rows_condition = preceding_rows_condition & (preceding_rows_chunk['end_previous']<=preceding_rows_chunk['end'])
-        return preceding_rows_chunk[preceding_rows_condition]
+    # Subtracting earlier periods and modifying the dataset in numpy is much faster than in pandas
+    columns_to_process = [x for x in a_pivot.columns.to_list() if x not in ['Shares']]
+    def do_subtract(df): #Encapsulating this code for better memory management - arrays created inside will be discarded after return
+        # This is a lookup table to make possible the numpy nansum operation below
+        # Columns of this lookup table are: ['index', 'cik', 'start', 'end']
+        earlier_period_indexes = df.index.to_frame(index=False).reset_index(drop=False) #Create the 'index' column
+        # Integer comparisons are much faster than date comparisons, so we convert the dates to integers
+        earlier_period_indexes[['start','end']] = earlier_period_indexes[['start','end']].map(lambda x:x.toordinal())
+        earlier_period_indexes = earlier_period_indexes.groupby(by='cik')[['index','start','end']].apply(
+            lambda x:get_earlier_period_indexes(x.to_numpy()))
+        earlier_period_indexes = np.concatenate(earlier_period_indexes.to_list())
 
-    preceding_rows_df = pd.concat(map(chunk_merge, itertools.batched(index_projection['cik'].unique().tolist(), 500)))
-    preceding_rows_df = preceding_rows_df.groupby(by='index')['index_previous'].apply(lambda x:x.to_list())
-    preceding_rows_df = preceding_rows_df.sort_index()
+        numpy_df = df.loc[:,columns_to_process].to_numpy()
+        split_point_indexes = earlier_period_indexes[:,0] != np.roll(earlier_period_indexes[:,0], 1)
+        split_point_indexes[0] = True
+        split_point_indexes = np.nonzero(split_point_indexes)[0]
+        for a_split in np.split(earlier_period_indexes, split_point_indexes)[1:]:
+            numpy_df[a_split[0,0]] -= np.nansum(numpy_df[a_split[:,1]],axis=0)
+        return numpy_df
 
-    numpy_df = a_pivot.iloc[:,column_indexes].to_numpy()
-    for i,preceding_row_indexes in preceding_rows_df.items():
-        numpy_df[i] -= np.nansum(numpy_df[preceding_row_indexes],axis=0)
-    new_contents_df = pd.DataFrame(data=numpy_df, columns=a_pivot.columns[column_indexes], index=a_pivot.index)
-    a_pivot[new_contents_df.columns.to_list()] = new_contents_df
+    a_pivot[columns_to_process] = pd.DataFrame(data=do_subtract(a_pivot), columns=columns_to_process, index=a_pivot.index)
 
-    a_pivot = a_pivot.rename(columns={'end':'date'}).sort_values(by=['date','start'])
-    a_pivot = a_pivot.drop(columns=['start']).groupby(by=['cik','date']).mean()
+    a_pivot.index.rename({'end':'date'}, inplace=True)
+    a_pivot = a_pivot.groupby(by=['cik','date']).mean()  #['cik','date'] is the new, sorted index
+
+    # Sanitize the financial data according to business logic.
     a_pivot['Revenue'] = a_pivot['Revenue'].combine_first(a_pivot['COGS']+a_pivot['GrossProfit'])
     a_pivot['COGS'] = a_pivot['COGS'].combine_first(a_pivot['Revenue']-a_pivot['GrossProfit'])
     a_pivot['GrossProfit'] = a_pivot['GrossProfit'].combine_first(a_pivot['Revenue']-a_pivot['COGS'])
     a_pivot = a_pivot.dropna(thresh=3) #Remove the lines that have too little data
     a_pivot['NetCashFinancing'] = a_pivot['NetCashFinancing'].fillna(0.0)
     a_pivot['Liabilities'] = a_pivot['Assets']-a_pivot['Equity']
-    a_pivot = a_pivot.reset_index(drop=False)
 
-    df_finished = pd.concat(list(map(per_cik_conversions,a_pivot.groupby(by='cik'))))
+    # Here we compute trailing-twelve-month values out of per-quarter values. This can only be done on a cik-per-cik basis.
+    tags_to_ttm = ['Revenue', 'GrossProfit', 'NetCashOperating', 'NetCashFinancing', 'Earnings']
+    ttm = a_pivot.groupby(by='cik')[tags_to_ttm].rolling(window=4).sum()
+    ttm = ttm.droplevel(0, axis='index')  #The grouping prepends a superfluous 'cik' index column.
+    ttm = ttm.rename(columns={ i:f"{i}_ttm" for i in tags_to_ttm })
+    a_pivot = pd.concat([a_pivot, ttm], axis='columns')
 
-#   The final values will be in billions and rounded.
-    columns_to_ignore_rounding = ['cik','date','ticker','exchange']
-    for a_col in df_finished.columns.to_list() + ['EntityShares','PublicFloat']:
+    if args.dump_intermediate_stages:
+        a_pivot.to_csv(f'financials_{a_date:%Y-%m-%d}.csv.gz')
+
+    # Drop all records per cik, leaving only the last one. This is the last known data for the given a_date and
+    # the whole purpose of assembling the final dataset as a series of snapshots.
+    a_pivot = a_pivot.reset_index(level='date',drop=False)
+    a_pivot = a_pivot[~a_pivot.index.duplicated(keep='last')]
+    a_pivot = a_pivot.set_index('date', append=True)  #re-introduce date as the right-most index column
+
+    #Re-introduce the dei data, that is reported outside the date ranges of the us-gaap facts. Again, keep only the last known data.
+    if not dei_facts.empty:
+        dei_facts = merge_facts(dei_facts).dropna(axis='columns', how='all').dropna(axis='index', how='all').groupby(by='cik').last()
+        a_pivot = a_pivot.drop(columns=dei_facts.columns.to_list()).merge(dei_facts,left_index=True,right_index=True,how='left')
+        a_pivot['Shares'] = a_pivot['EntityShares'].combine_first(a_pivot['Shares'])
+
+    # The final values will be in billions and rounded, except the headcount
+    columns_to_round = a_pivot.columns.to_list()
+    columns_to_round.remove('Employees')
+    a_pivot[columns_to_round] = a_pivot[columns_to_round].map(lambda x:round(x/1e9, 6), na_action='ignore')
+
+    # After the rounding run we can now add the ticker and exchange columns, which are strings.
+    a_pivot = enrich_with_tickers(a_pivot, tickers_mapping)
+
+    # Add the snapshot date as the left-most index column
+    a_pivot['snapshot'] = a_date
+    a_pivot = a_pivot.set_index('snapshot', append=True)
+    a_pivot = a_pivot.reorder_levels(['snapshot','cik','date'])
+
+    a_pivot = a_pivot[[i for i in export_schema if i not in list(a_pivot.index.names)]]  #enforce consistent column order across versions
+
+    ciks_nunique = a_pivot.index.get_level_values('cik').nunique()
+    a_pivot = a_pivot.to_csv(index=True, header=False, date_format='%Y-%m-%d', float_format='%f')
+    print(f'Snapshot {a_date.date()}: {ciks_nunique} unique ciks processed into a CSV string of {sys.getsizeof(a_pivot)/2**20:.2f}MB.', file=sys.stderr)
+    return a_pivot
+
+# %%
+def make_snapshots(companyfacts, args):
+    # Keeping the index columns is vital to reduce the memory footprint. In its current form, the companyfacts
+    # dataframe occupies about 1 GiB of RAM. If we do a .reset_index(drop=False), the size baloons to above 4GiB
+    # Index columns are: filed,cik,end,start,fact
+    # Value column is: val_final
+    # These come largely from variable data_column_names in function batch_convert_json
+
+    today = datetime.datetime.today().date()
+    dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2012,today.year+1)) for month in list(range(1,13)) ]
+    dates_to_compute = [ i for i in dates_to_compute if i < today ]
+    if args.partial_dataset:  # Only first, last date and today
+        dates_to_compute = [ dates_to_compute[i] for i in [0,-1] ]
+    dates_to_compute.append(today)
+    dates_to_compute = pd.to_datetime(dates_to_compute)
+    print(f"Total number of dates to create snapshots for: {len(dates_to_compute)}", file=sys.stderr)
+
+    # If cik-to-ticker mapping from the SEC is available, use it
+    try:
+        with open('company_tickers_exchange.json','r') as f:
+            tickers = json.load(f)
+        tickers = pd.DataFrame(columns=tickers['fields'], data=tickers['data'],dtype=str)
+        tickers = tickers[tickers['exchange']!='OTC'].dropna() #leave only tickers traded on an exchange
+        tickers['exchange'] = tickers['exchange'].str.upper().str.strip()
+        tickers['cik'] = tickers['cik'].str.zfill(10)
+        tickers['len'] = 4
+        tickers.loc[tickers[tickers['ticker'].str.contains('-')].index,'len'] += 1
+        tickers['ticker'] = tickers.apply(lambda row: str(row.ticker[:row.len]),axis='columns').str.rstrip().str.rstrip('-').str.upper()
+        tickers = tickers.sort_values(by=['cik','exchange','ticker','len']).drop_duplicates(subset=['cik'],keep='first').set_index('cik').drop(columns=['len'])
+    except:
+        print(f'company_tickers_exchange.json not found in {os.getcwd()} or unreadable. Ticker columns will be empty.', file=sys.stderr)
+        tickers = None
+
+    # We assume a cik no longer files with the SEC if its last filing date is at least one year earlier than the snapshot date.
+    # We ignore these ciks to not clutter the output dataset with identical records for defunct ciks.
+    # This provides a significant performance boost, too
+    cik_filings = companyfacts.groupby(by=['cik','filed']).first().reset_index(drop=False)[['cik','filed']]
+    defunct_dates = pd.to_datetime(cik_filings.groupby(by='cik')['filed'].max()) + pd.DateOffset(months=13)
+
+    def make_single_pivot(a_date):
+        active_ciks = set(defunct_dates[defunct_dates >= a_date].index.to_list())
+        filing_dates = set(cik_filings[cik_filings['filed'] < a_date]['filed'].unique().tolist())
+        a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & companyfacts.index.isin(filing_dates, level='filed')].copy()
+        return a_date, a_pivot, tickers, args
+
+    # We dump the results to stdout periodically, because otherwise RAM runs out pretty quickly.
+    # This ugly workaround with batches is needed, because the legacy multiprocessing backend does not support return_as='generator'
+    # By the way, re-using the worker pool by Prallel is possible, but for some reason this causes memory leaks that are very hard to track.
+    # The implementation below turned out to be the most memory efficient.
+    dump_memory_usage('Start assembling snapshots')
+    print(','.join(export_schema)) #Print the CSV header
+    for a_batch in itertools.batched(dates_to_compute, 2*args.vCPUs):
+        print(''.join(Parallel()(delayed(process_single_pivot)(*make_single_pivot(i)) for i in a_batch)), end='')
+        dump_memory_usage('A batch was completed')
+
+# %%
+def main(args):
+    with redirect_stdout(sys.stderr):
+        print('Python version:', sys.version)
+        print('CLI switches:', args)
+        print('Compiling numba functions...')
+        if get_earlier_period_indexes(np.zeros(shape=(1,1))).size >= 0:
+            print('Compile succeeded.')
+        print(f'Using {args.vCPUs} CPU(s), you should have at least {max(2,args.vCPUs)*4} GiB of RAM.')
+        dump_memory_usage('Program start')
+        intermediate_stage_name = 'companyfacts.csv.gz'
         try:
-            if a_col in df_finished.columns and a_col not in columns_to_ignore_rounding:
-                df_finished[a_col] = (df_finished[a_col] / 1e9).round(6)
-            if a_col in df_dei.columns and a_col not in columns_to_ignore_rounding:
-                df_dei[a_col] = (df_dei[a_col] / 1e9).round(6)
+            #If the intermediate stage is already present in the working directory, load it.
+            companyfacts = pd.read_csv(intermediate_stage_name,
+                                       index_col=['filed','cik','end','start','fact'],
+                                       date_format='ISO8601',
+                                       dtype={'cik':str})
+            if companyfacts.empty:
+                raise Exception
+            else:
+                print(f'{intermediate_stage_name} found and loaded. Skipping json processing.')
         except:
-            print(f"Snapshot {a_date}: Error! Column {a_col} is not numeric!")
-
-    df_finished = df_finished.sort_values(by=['cik','date'])
-    df_finished['snapshot'] = a_date
-    df_finished = df_finished.set_index(['snapshot','cik','date']).reset_index(drop=False)
-
-    if a_date == today and export_additional_datasets:
-        df_finished.drop(columns=['snapshot']).to_csv(f"financials.csv.gz",index=False)
-        print('Snapshot for today: {} unique ciks exported to financials dataset'.format(len(df_finished.cik.unique())))
-    
-    df_finished = df_finished.drop_duplicates(subset=['snapshot','cik'],keep='last')
-    df_finished = pd.merge(df_finished,df_dei,how='left',on='cik')
-    df_finished['Shares'] = df_finished['EntityShares'].combine_first(df_finished['Shares'])
-    df_finished = df_finished.drop(columns=['EntityShares'])
-
-    print('Snapshot {}: {} unique ciks processed'.format(a_date, len(df_finished.cik.unique())))
-    return df_finished
+            companyfacts = make_companyfacts(args)
+            if args.dump_intermediate_stages:
+                print(f'Saving {intermediate_stage_name} as requested.')
+                companyfacts.to_csv(intermediate_stage_name)
+    make_snapshots(companyfacts.drop(columns=['val','corrected']), args) #val_final remains
 
 # %%
-with parallel_config(backend='multiprocessing', n_jobs=max_jobs):
-    # Once again, the legacy backend works much better
-    print("Creating pivots...")
-    all_pivots = Parallel()(delayed(create_pivot)(i) for i in dates_to_compute)
-    print("Creating snapshots...")
-    all_pivots = Parallel()(delayed(process_single_pivot)(i) for i in all_pivots)
-
-# %%
-print('Building dataset...')
-all_pivots = pd.concat(all_pivots)
-if all_pivots.empty:
-    print('No results')
-    quit()
-
-# %%
-print('Post-processing and saving results as CSV...')
-final_keys = ['snapshot','cik','date']
-
-# After a certain date is repeated more than 12 snapshots, we assume the cik no longer files with the SEC.
-# We drop these records from the dataset, but we do not drop the corresponding enitre ciks,
-# because this does not represent a case of invalid data.
-defunct_ciks = all_pivots[['cik','date']].value_counts()
-defunct_ciks = defunct_ciks[defunct_ciks>12].to_frame().reset_index(drop=False)
-all_pivots = all_pivots.sort_values(by=final_keys).set_index(final_keys)
-defunct_keys_to_drop = pd.merge(all_pivots.index.to_frame(name=['s','c','d']), defunct_ciks.rename(columns={'cik':'c','date':'d'}), how='inner')
-defunct_keys_to_drop = pd.MultiIndex.from_frame(defunct_keys_to_drop.drop(columns=['count']),names=final_keys)
-all_pivots = all_pivots.drop(index=defunct_keys_to_drop)
-
-all_pivots.to_csv(f"snapshots.csv.gz",index=True)
-print('Done')
+if __name__ == "__main__":
+    cli_args = parse_arguments()
+#   In my experience, the legacy backend is quite solid. The default 'loky' backend keeps throwing
+#   warnings about memory leaks of unknown origin and is too picky as it tries to pickle function arguments and global variables
+#   that cannot be pickled (ZipFile objects are one example).
+#   The threading backend works essentially with only one CPU core because of the python GIL and for now I cannot think
+#   of any way to make the logic in this program thread-safe without making an unmaintainable mess out of it.
+    with parallel_config(backend='multiprocessing', n_jobs=cli_args.max_jobs):
+        if cli_args.max_jobs == 1:
+            with cProfile.Profile(builtins=False) as pr:
+                main(cli_args)
+                pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('batch_convert_json')
+                pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('process_single_pivot')
+        else:
+            main(cli_args)
+    print('Done without errors.', file=sys.stderr)
