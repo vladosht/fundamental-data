@@ -143,8 +143,11 @@ def dump_memory_usage(note=None,top_n=5):
           f"{round(sum(sizes),1)}GiB used by the top {top_n} memory objects:", sizes, file=sys.stderr)
 
 # %%
-# We do data reduction here, because we do not need most of the json content
-def parse_a_json_dict(jdict):
+def reduce_a_json_dict(jdict):
+    """
+    We take the parsed json data and do data reduction here,
+    because we do not need most of the content
+    """
     # Basic sanity checks for the json contents. These checks fail with a KeyError
     cik = str(jdict['cik']).zfill(10)  #A cik must be present
     if not len(jdict['facts']['us-gaap'].keys()) >= 2:  #At least this many distinct facts must be present
@@ -191,7 +194,7 @@ def batch_convert_json(list_of_json_files):
                     pass
             sys.exit(1)
         try:
-            parsed_data += parse_a_json_dict(jfile)
+            parsed_data += reduce_a_json_dict(jfile)
         except KeyError:
             pass #A valid json file without financial data is not an error. Silently skipping...
 
@@ -207,18 +210,23 @@ def batch_convert_json(list_of_json_files):
 
     if not df.empty:
         # Sanitize the datatypes
+        df['val'] = pd.to_numeric(df['val'], errors='coerce')
         for a_date_column in ['start','end','filed']:
             df[a_date_column] = pd.to_datetime(df[a_date_column], yearfirst=True, errors='coerce')
-        df['val'] = pd.to_numeric(df['val'], errors='coerce')
+        # Filings for future periods may distort downstream processing, so we remove them. About 80% of these records are dei.* facts, anyway.
+        df = df[(df['start'] <= df['end']) & ~(df['start']>df['filed'])]
+
+    if not df.empty:
         # We treat all columns except 'val' as key. They should generally be unique, because a company should not report twice per day
         # divergent values for the same fact. We do aggregate here along the key however, just in case this is not true.
-        df = df.groupby(by=data_column_names[:-1])['val'].max().reset_index(drop=False)
+        data_column_names.remove('val')
+        df = df.groupby(by=data_column_names)['val'].last()  #This also sorts the key
         # Many companies have submitted wrong or invalid values during the years. Most of these invalid values have been corrected eventually
         # with later filings. For each cik/period/fact combination, we determine the final available filing, so that the latest and most correct
         # value is used.
-        final_values = df.drop_duplicates(subset=data_column_names[1:-1],keep='last').set_index(data_column_names[1:-1]).drop(columns='filed')
-        df = df.set_index(data_column_names[:-1]) #With "filed"
-        df = df.merge(final_values,left_index=True,right_index=True,suffixes=(None, '_final'))
+        final_values = df.droplevel('filed')
+        final_values = final_values[~final_values.index.duplicated(keep='last')]
+        df = pd.merge(df, final_values, left_index=True, right_index=True, suffixes=(None, '_final'))
         df['corrected'] = df['val'] != df['val_final']
 
     return df
@@ -249,9 +257,10 @@ def make_companyfacts(args, batch_size = 1000):
     return job_results
 
 # %%
-# The individual XBRL tags are combined into new columns, which carry the final business meaning.
 def merge_facts(pivot):
-
+    """
+    The individual XBRL tags are combined into new columns, which carry the final business meaning.
+    """
     # Some facts were introduced later during the years and for earlier snapshots
     # we must add them manually to avoid KeyErrors
     missing_facts = set(known_facts).difference(pivot.columns.to_list())
@@ -347,8 +356,7 @@ def enrich_with_tickers(snapshots, tickers_info):
     return snapshots.merge(tickers_info[['ticker','exchange']],how='left',left_index=True,right_index=True)
 
 # %%
-# Numba is the speed king :-)
-@njit
+@njit # Numba is the speed king :-)
 def scan_periods(input_arr, output_arr):
     start, end = (1,2) #indexes of the period start and period end columns for both input and output arrays.
     return_length_only = len(output_arr.shape) <= 1
