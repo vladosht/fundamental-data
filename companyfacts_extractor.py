@@ -217,7 +217,7 @@ def batch_convert_json(list_of_json_files):
 
         # Filings for future periods may distort downstream processing, so we remove them. About 80% of these records are dei.* facts, anyway.
         # Reporting periods longer than four quarters also cause problems
-        df = df[(df['start'] <= df['end']) & ~(df['start']>df['filed']) & ~(df['quarter_count']>4)]
+        df = df[(df['start'] <= df['end']) & (df['end'] <= df['filed']) & ~(df['quarter_count']>4)]
 
     if not df.empty:
         # We treat all columns except 'val' as key. They should generally be unique, because a company should not report twice per day
@@ -506,7 +506,7 @@ def make_snapshots(companyfacts, args):
     # These come largely from variable data_column_names in function batch_convert_json
 
     today = datetime.datetime.today().date()
-    dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2012,today.year+1)) for month in list(range(1,13)) ]
+    dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2013,today.year+1)) for month in list(range(1,13)) ]
     dates_to_compute = [ i for i in dates_to_compute if i < today ]
     if args.partial_dataset:  # Only first, last date and today
         dates_to_compute = [ dates_to_compute[i] for i in [0,-1] ]
