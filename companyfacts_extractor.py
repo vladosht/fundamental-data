@@ -428,7 +428,7 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     a_pivot[columns_to_process] = pd.DataFrame(data=do_subtract(a_pivot), columns=columns_to_process, index=a_pivot.index)
 
     a_pivot.index.rename({'end':'date'}, inplace=True)
-    a_pivot = a_pivot.groupby(by=['cik','date']).mean()  #['cik','date'] is the new, sorted index
+    a_pivot = a_pivot.groupby(by=['cik','date']).last()  #['cik','date'] is the new, sorted index
 
     # Sanitize the financial data according to business logic.
     a_pivot['Revenue'] = a_pivot['Revenue'].combine_first(a_pivot['COGS']+a_pivot['GrossProfit'])
@@ -438,12 +438,17 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     a_pivot['NetCashFinancing'] = a_pivot['NetCashFinancing'].fillna(0.0)
     a_pivot['Liabilities'] = a_pivot['Assets']-a_pivot['Equity']
 
-    # Here we compute trailing-twelve-month values out of per-quarter values. This can only be done on a cik-per-cik basis.
-    tags_to_ttm = ['Revenue', 'GrossProfit', 'NetCashOperating', 'NetCashFinancing', 'Earnings']
-    ttm = a_pivot.groupby(by='cik')[tags_to_ttm].rolling(window=4).sum()
-    ttm = ttm.droplevel(0, axis='index')  #The grouping prepends a superfluous 'cik' index column.
-    ttm = ttm.rename(columns={ i:f"{i}_ttm" for i in tags_to_ttm })
-    a_pivot = pd.concat([a_pivot, ttm], axis='columns')
+    def compute_ttm(df):
+        """
+        Here we compute trailing-twelve-month values out of per-quarter values.
+        This can only be done on a cik-per-cik basis.
+        """
+        tags_to_ttm = ['Revenue', 'GrossProfit', 'NetCashOperating', 'NetCashFinancing', 'Earnings']
+        ttm_columns = { i:f"{i}_ttm" for i in tags_to_ttm }
+        ttm = df[tags_to_ttm].groupby(by='cik')
+        ttm = ttm.rolling(window=pd.Timedelta(weeks=52), on=df.index.get_level_values('date'), min_periods=4).sum()
+        return ttm.rename(columns=ttm_columns).droplevel(0)  #The grouping prepends a superfluous 'cik' index column
+    a_pivot = pd.concat([a_pivot, compute_ttm(a_pivot)], axis='columns')
 
     if args.dump_intermediate_stages:
         a_pivot.to_csv(f'financials_{a_date:%Y-%m-%d}.csv.gz')
