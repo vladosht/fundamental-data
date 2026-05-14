@@ -213,13 +213,17 @@ def batch_convert_json(list_of_json_files):
         df['val'] = pd.to_numeric(df['val'], errors='coerce')
         for a_date_column in ['start','end','filed']:
             df[a_date_column] = pd.to_datetime(df[a_date_column], yearfirst=True, errors='coerce')
+        df['quarter_count'] = (pd.to_timedelta(df['end'] - df['start']).dt.days / 7 / 13).round(0).astype(int)
+
         # Filings for future periods may distort downstream processing, so we remove them. About 80% of these records are dei.* facts, anyway.
-        df = df[(df['start'] <= df['end']) & ~(df['start']>df['filed'])]
+        # Reporting periods longer than four quarters also cause problems
+        df = df[(df['start'] <= df['end']) & ~(df['start']>df['filed']) & ~(df['quarter_count']>4)]
 
     if not df.empty:
         # We treat all columns except 'val' as key. They should generally be unique, because a company should not report twice per day
         # divergent values for the same fact. We do aggregate here along the key however, just in case this is not true.
         data_column_names.remove('val')
+        data_column_names.append('quarter_count')
         df = df.groupby(by=data_column_names)['val'].last()  #This also sorts the key
         # Many companies have submitted wrong or invalid values during the years. Most of these invalid values have been corrected eventually
         # with later filings. For each cik/period/fact combination, we determine the final available filing, so that the latest and most correct
@@ -392,7 +396,7 @@ def get_earlier_period_indexes(n):
 # %%
 def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     # We need a new order of the keys, so that sorting along them will make possible the do_subtract logic below.
-    a_pivot = a_pivot.reorder_levels(['cik','fact','start','end','filed']).sort_index().droplevel('filed', axis='index')
+    a_pivot = a_pivot.reorder_levels(['cik','fact','start','end','quarter_count','filed']).sort_index().droplevel('filed', axis='index')
     a_pivot = a_pivot[~a_pivot.index.duplicated(keep='last')].unstack(level='fact').droplevel(0, axis='columns')
     # The index loses its sort order from above after the unstack operation.
     # This breaks the logic below, so here we explicitly sort the index again.
@@ -400,8 +404,8 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     # The dei facts are almost always reported for dates unlike those for us-gaap facts. Thus, they require special treatment.
     # We save these columns for later.
     dei_facts = a_pivot.filter(regex=r'^dei\.Entity', axis='columns').copy()
-    # Combine the individual fact columns into aggregate columns.
-    a_pivot = merge_facts(a_pivot)
+    # Combine the individual fact columns into aggregate columns and treat the quarter count as a regular data column for later use.
+    a_pivot = merge_facts(a_pivot).reset_index(level='quarter_count')
 
     # The data in the SEC file has been submitted as relevant for different period lengths, usually from 1 quarter to 1 year.
     # Here we convert all data to per-quarter data by subtracting earlier periods from the later, larger ones, which contain them.
@@ -426,9 +430,17 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
         return numpy_df
 
     a_pivot[columns_to_process] = pd.DataFrame(data=do_subtract(a_pivot), columns=columns_to_process, index=a_pivot.index)
+    # The processing in numpy above has cast quarter_count to float. We flip it back to int.
+    # We also consider point-in-time data (quarter_count=0) to be for a single quarter (quarter_count=1)
+    a_pivot['quarter_count'] = a_pivot['quarter_count'].round(0).astype(int).replace({0:1})
+    # About 1% of records remain with a quarter_count > 1. Since we are building a quarterly dataframe, we will coerce
+    # these records to a quarterly value.
+    a_pivot = a_pivot.div(a_pivot['quarter_count'],axis='index').drop(columns='quarter_count')
 
+    # Here we combine all data for a given end-date into one record. This unites all facts, regardles of their reporting
+    # period - point-in-time or one quarter.
     a_pivot.index.rename({'end':'date'}, inplace=True)
-    a_pivot = a_pivot.groupby(by=['cik','date']).last()  #['cik','date'] is the new, sorted index
+    a_pivot = a_pivot.groupby(by=['cik','date']).mean()  #['cik','date'] is the new, sorted index
 
     # Sanitize the financial data according to business logic.
     a_pivot['Revenue'] = a_pivot['Revenue'].combine_first(a_pivot['COGS']+a_pivot['GrossProfit'])
@@ -554,7 +566,7 @@ def main(args):
         try:
             #If the intermediate stage is already present in the working directory, load it.
             companyfacts = pd.read_csv(intermediate_stage_name,
-                                       index_col=['filed','cik','end','start','fact'],
+                                       index_col=['filed','cik','end','start','fact','quarter_count'],
                                        date_format='ISO8601',
                                        dtype={'cik':str})
             if companyfacts.empty:
