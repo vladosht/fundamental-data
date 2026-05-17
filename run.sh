@@ -5,7 +5,7 @@
 # --max-jobs=1 option to disable multiprocessing, which is on by default.
 set -o pipefail
 
-for cmd in curl gzip gcloud; do
+for cmd in curl gzip; do
    if ! command -v "$cmd" &> /dev/null; then
       echo "Error: Required command '$cmd' not available." >&2
       exit 1  #Dependency not found
@@ -63,6 +63,6 @@ then
 else
    echo "Starting snapshots generation." >&2
    curl --fail --no-progress-meter --user-agent "$SNAPSHOTS_SEC_UA" 'https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip'
-fi | ./companyfacts_extractor.py "$@" | gzip | gcloud storage cp - gs://${SNAPSHOTS_TARGET_FILE}.gz --quiet --no-user-output-enabled; } || { echo "Processing failure!" >&2; exit 10; }
+fi | ./companyfacts_extractor.py "$@" | gzip | ./upload_results.py; } || { echo "Processing failure!" >&2; exit 10; }
 
-echo "All done successfully." >&2
+echo "Upload of results was successful." >&2
