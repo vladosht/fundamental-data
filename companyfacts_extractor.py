@@ -243,7 +243,9 @@ def make_companyfacts(args, batch_size = 1000):
 
     # Load the SEC zip file from standard input
     print("Reading standard input...")
-    source_zip = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()), mode='r')
+    source_zip = sys.stdin.buffer.read()
+    print(f"{len(source_zip)} bytes read.")
+    source_zip = zipfile.ZipFile(io.BytesIO(source_zip), mode='r')
     files_to_parse = source_zip.namelist()[debugging_slice]
     print(f'Parsing {len(files_to_parse)} json files in batches of {batch_size}...')
 
@@ -505,6 +507,10 @@ def make_snapshots(companyfacts, args):
     # Value column is: val_final
     # These come largely from variable data_column_names in function batch_convert_json
 
+    print('Pre-compiling numba functions...', file=sys.stderr)  #Because they are used within the worker processes...
+    if get_earlier_period_indexes(np.zeros(shape=(1,1))).size >= 0:
+        print('Compile succeeded.', file=sys.stderr)
+
     today = datetime.datetime.today().date()
     dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2013,today.year+1)) for month in list(range(1,13)) ]
     dates_to_compute = [ i for i in dates_to_compute if i < today ]
@@ -557,9 +563,6 @@ def main(args):
     with redirect_stdout(sys.stderr):
         print('Python version:', sys.version)
         print('CLI switches:', args)
-        print('Compiling numba functions...')
-        if get_earlier_period_indexes(np.zeros(shape=(1,1))).size >= 0:
-            print('Compile succeeded.')
         print(f'Using {args.vCPUs} CPU(s), you should have at least {max(2,args.vCPUs)*4} GiB of RAM.')
         dump_memory_usage('Program start')
         intermediate_stage_name = 'companyfacts.csv.gz'

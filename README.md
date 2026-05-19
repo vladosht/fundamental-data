@@ -18,7 +18,7 @@ The *jupyter notebooks* here were originally developed on [Kaggle](https://www.k
 1. Clone this repository
 2. Download the companyfacts.zip to its directory
 3. Optionally download there the [company_tickers_exchange.json](https://www.sec.gov/files/company_tickers_exchange.json) file, if you want the output CSV to contain the ticker symbols of the public companies. This file is also provided by the SEC.
-4. As this is a python project, check that you have python installed with `python3 --version`. The program needs at least version 3.9
+4. As this is a python project, check that you have python installed with `python3 --version`. The program needs at least version 3.12
 5. For the version displayed, make sure that all packages listed in the requirements.txt are installed and importable.
 6. Make sure you have at least 4GiB of RAM available per CPU core/thread, but no less than 8GiB in total.
 7. Change to the repository directory with cd and read the online help of the program with `./companyfacts_extractor.py --help`. If you can, then your python environment is set up accordingly. 
@@ -29,6 +29,6 @@ The *jupyter notebooks* here were originally developed on [Kaggle](https://www.k
 ## Side notes
 *companyfacts_extractor.py* was developed and tested in a Google Cloud Platform Virtual Machine of type n4d-standard-2  
 It is a 2vCPU, 8GiB RAM amd64 instance, running Debian GNU/Linux 13 (trixie).  
-The sysbench (v1.0.20) score of the instance, obtained with "sysbench --threads=\$(nproc) cpu run", is 5375.75  
+The sysbench (v1.0.20) score of the instance, obtained with `sysbench --threads=$(nproc) cpu run`, is 5375.75  
 In this instance, the program runs to completion within 20 min. This amounts to a cost of about $0.04 per full dataset run.  
 The program is a native command line tool which is quite verbose, but only on stderr. Standard output is reserved only for the CSV stream. Therefore, it should be readily usable by AI agents.

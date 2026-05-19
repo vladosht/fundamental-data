@@ -1,0 +1,4 @@
+# Documentation in https://docs.cloud.google.com/sdk/gcloud/reference/topic/gcloudignore
+# To check what will be uploaded: gcloud meta list-files-for-upload
+#!include:.gitignore
+#!include:.dockerignore
