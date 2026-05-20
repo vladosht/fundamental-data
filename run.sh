@@ -6,7 +6,7 @@
 # Running this script with the --help option will check all necessary prerequisites before printing a usage message.
 set -o pipefail
 echo "Companyfacts batch script $0 $*: Running as $(whoami) in $(pwd)" >&2
-df -h $(pwd) >&2  #Print the available free space
+df -h . >&2  #Print the available free space
 
 for cmd in curl gzip; do
    if ! command -v "$cmd" &> /dev/null; then
