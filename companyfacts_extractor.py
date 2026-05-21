@@ -7,7 +7,7 @@ import zipfile, json, itertools
 import datetime, re
 import pandas as pd
 import numpy as np
-from numba import njit
+from numba import njit, prange
 from joblib import Parallel, delayed, parallel_config, cpu_count
 warnings.filterwarnings("error")  #Enforce a kind of a 'strict' mode.
 
@@ -362,12 +362,11 @@ def enrich_with_tickers(snapshots, tickers_info):
     return snapshots.merge(tickers_info[['ticker','exchange']],how='left',left_index=True,right_index=True)
 
 # %%
-@njit # Numba is the speed king :-)
-def scan_periods(input_arr, output_arr):
-    start, end = (1,2) #indexes of the period start and period end columns for both input and output arrays.
-    return_length_only = len(output_arr.shape) <= 1
-    actual_length = 0
-    for i in np.arange(1, input_arr.shape[0]):
+@njit # Numba is the speed king!
+def scan_periods_to_dict(input_arr):
+    idx, start, end = (0,1,2) #Readable names for the columns of the array
+    output = dict()  #This is a numba dict, not a python dict! It behaves differently...
+    for i in prange(1, input_arr.shape[0]):
         this_period = input_arr[i]
         # Here we enforce the following logic:
         # index_earlier_period < index
@@ -375,25 +374,10 @@ def scan_periods(input_arr, output_arr):
         # start_earlier_period >= start
         # end_earlier_period <= end
         earlier_periods = earlier_periods[(earlier_periods[:,start] >= this_period[start])&(earlier_periods[:,end] <= this_period[end])]
-        remaining_length = earlier_periods.shape[0]
-        if remaining_length < 1:
-            continue
-        # we do broadcasting, so that this period is in the second column (index 1)
-        earlier_periods[:,1] = this_period[0]
-        if not return_length_only:
-            output_arr[actual_length:actual_length+remaining_length] = earlier_periods[:,:2]
-        actual_length += remaining_length
-    if return_length_only:
-        output_arr[0] = actual_length
-    return output_arr
-
-# For all its raw speed, numba is best suited to work on numpy arrays that already exist and do not change shape.
-# Therefore, here we implement a 2-pass logic: first pass to determine the shape of the output and a second
-# pass to fill an output array with data.
-def get_earlier_period_indexes(n):
-    output_length = scan_periods(n, np.array([0]))[0]
-    # We flip the output columns, so that the current period indexes are first. The downstream logic depends on this.
-    return scan_periods(n, np.empty(shape=(output_length,2),dtype=n.dtype))[:,[1,0]] #<-the flip
+        earlier_periods_count = earlier_periods.shape[0]
+        if earlier_periods_count > 0:
+            output[this_period[idx]] = earlier_periods[:,idx]
+    return output
 
 # %%
 def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
@@ -411,24 +395,28 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
 
     # The data in the SEC file has been submitted as relevant for different period lengths, usually from 1 quarter to 1 year.
     # Here we convert all data to per-quarter data by subtracting earlier periods from the later, larger ones, which contain them.
-    # Subtracting earlier periods and modifying the dataset in numpy is much faster than in pandas
     columns_to_process = [x for x in a_pivot.columns.to_list() if x not in ['Shares']]
-    def do_subtract(df): #Encapsulating this code for better memory management - arrays created inside will be discarded after return
+    def do_subtract(df): #Encapsulating this code for better memory management - objects created inside will be discarded after return
+
         # This is a lookup table to make possible the numpy nansum operation below
         # Columns of this lookup table are: ['index', 'cik', 'start', 'end']
         earlier_period_indexes = df.index.to_frame(index=False).reset_index(drop=False) #Create the 'index' column
-        # Integer comparisons are much faster than date comparisons, so we convert the dates to integers
-        earlier_period_indexes[['start','end']] = earlier_period_indexes[['start','end']].map(lambda x:x.toordinal())
-        earlier_period_indexes = earlier_period_indexes.groupby(by='cik')[['index','start','end']].apply(
-            lambda x:get_earlier_period_indexes(x.to_numpy()))
-        earlier_period_indexes = np.concatenate(earlier_period_indexes.to_list())
 
+        # Integer comparisons are much faster than date comparisons, so we convert the dates to integers
+        for i in ['start','end']:
+            earlier_period_indexes[i] = pd.to_numeric(earlier_period_indexes[i], downcast='integer')
+
+        # Period subtraction is only possible per-cik
+        earlier_period_indexes = earlier_period_indexes.groupby(by='cik')[['index','start','end']]
+        earlier_period_indexes = earlier_period_indexes.apply(lambda x:dict(scan_periods_to_dict(x.to_numpy())))
+        # earlier_period_indexes is now a pd.Series of dicts
+
+        # Subtracting earlier periods and modifying the dataset in numpy is much faster than in pandas
         numpy_df = df.loc[:,columns_to_process].to_numpy()
-        split_point_indexes = earlier_period_indexes[:,0] != np.roll(earlier_period_indexes[:,0], 1)
-        split_point_indexes[0] = True
-        split_point_indexes = np.nonzero(split_point_indexes)[0]
-        for a_split in np.split(earlier_period_indexes, split_point_indexes)[1:]:
-            numpy_df[a_split[0,0]] -= np.nansum(numpy_df[a_split[:,1]],axis=0)
+        for indexes_of_a_single_cik in earlier_period_indexes:
+            for this_period in sorted(indexes_of_a_single_cik.keys()):
+                numpy_df[this_period] -= np.nansum(numpy_df[indexes_of_a_single_cik[this_period]],axis=0)
+
         return numpy_df
 
     a_pivot[columns_to_process] = pd.DataFrame(data=do_subtract(a_pivot), columns=columns_to_process, index=a_pivot.index)
@@ -508,14 +496,14 @@ def make_snapshots(companyfacts, args):
     # These come largely from variable data_column_names in function batch_convert_json
 
     print('Pre-compiling numba functions...', file=sys.stderr)  #Because they are used within the worker processes...
-    if get_earlier_period_indexes(np.zeros(shape=(1,1))).size >= 0:
-        print('Compile succeeded.', file=sys.stderr)
+    scan_periods_to_dict(np.zeros(shape=(1,3)))
+    print('Compile succeeded.', file=sys.stderr)
 
     today = datetime.datetime.today().date()
     dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2013,today.year+1)) for month in list(range(1,13)) ]
     dates_to_compute = [ i for i in dates_to_compute if i < today ]
-    if args.partial_dataset:  # Only first, last date and today
-        dates_to_compute = [ dates_to_compute[i] for i in [0,-1] ]
+    if args.partial_dataset:  # Only the first two, the last date and today
+        dates_to_compute = [ dates_to_compute[i] for i in [0,1,-1] ]
     dates_to_compute.append(today)
     dates_to_compute = pd.to_datetime(dates_to_compute)
     print(f"Total number of dates to create snapshots for: {len(dates_to_compute)}", file=sys.stderr)
@@ -539,13 +527,11 @@ def make_snapshots(companyfacts, args):
     # We assume a cik no longer files with the SEC if its last filing date is at least one year earlier than the snapshot date.
     # We ignore these ciks to not clutter the output dataset with identical records for defunct ciks.
     # This provides a significant performance boost, too
-    cik_filings = companyfacts.groupby(by=['cik','filed']).first().reset_index(drop=False)[['cik','filed']]
-    defunct_dates = pd.to_datetime(cik_filings.groupby(by='cik')['filed'].max()) + pd.DateOffset(months=13)
+    defunct_dates = companyfacts.groupby(by=['cik','filed']).first().index.to_frame(index=False).groupby('cik')['filed'].max() + pd.DateOffset(months=13)
 
     def make_single_pivot(a_date):
-        active_ciks = set(defunct_dates[defunct_dates >= a_date].index.to_list())
-        filing_dates = set(cik_filings[cik_filings['filed'] < a_date]['filed'].unique().tolist())
-        a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & companyfacts.index.isin(filing_dates, level='filed')].copy()
+        active_ciks = defunct_dates[defunct_dates >= a_date].index.unique().tolist()
+        a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & ( companyfacts.index.get_level_values('filed') < a_date )]
         return a_date, a_pivot, tickers, args
 
     # We dump the results to stdout periodically, because otherwise RAM runs out pretty quickly.
