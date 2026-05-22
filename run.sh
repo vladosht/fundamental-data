@@ -55,7 +55,7 @@ url_json='https://www.sec.gov/files/company_tickers_exchange.json'  #About half 
 url_zip='https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip'  #At least 1.3 GiB
 for a_url in "$url_json" "$url_zip"; do
    sec_fname=$(basename $a_url)
-   if [ ! -f "$sec_fname" ] && ! curl -v --http2-prior-knowledge --fail --user-agent "$SNAPSHOTS_SEC_UA" --remote-name "$a_url"
+   if [ ! -f "$sec_fname" ] && ! curl --http2-prior-knowledge --fail --user-agent "$SNAPSHOTS_SEC_UA" --remote-name "$a_url"
    then
       echo "Downloading $sec_fname failed!" >&2
       rm -f $sec_fname  #The python script will fail if the file is present but corrupted

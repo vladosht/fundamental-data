@@ -1,0 +1,5 @@
+Cython
+regex
+numba
+pandas
+numpy
