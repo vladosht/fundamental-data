@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from functools import cache
 from numba import njit, prange
-from joblib import Parallel, delayed, parallel_config, cpu_count
+import concurrent.futures
 warnings.filterwarnings("error")  #Enforce a kind of a 'strict' mode.
 
 # %%
@@ -63,7 +63,7 @@ def parse_arguments():
     args = parser.parse_args()
     if args.max_jobs < 1:
         args.max_jobs = -1
-    args.vCPUs = cpu_count(only_physical_cores=False) if args.max_jobs < 1 else args.max_jobs
+    args.vCPUs = max(1,os.cpu_count()) if args.max_jobs < 1 else args.max_jobs
 
     return args
 
@@ -183,6 +183,10 @@ def get_re_patterns(config_json):
 
     return facts_regex, keys_regex
 
+# Initialize the cache with the only value it will ever get. This is a precaution against
+# concurrent access problems
+get_re_patterns(json_preprocessor_config)
+
 # %%
 def preprocess_json(jfile, config_json):
     facts_regex, keys_regex = get_re_patterns(config_json) # Get the cached regex patterns
@@ -221,34 +225,36 @@ def reduce_a_json_dict(jdict):
     return j
 
 # %%
-def batch_convert_json(list_of_json_files):
-    df = pd.DataFrame() #Always return a DataFrame for easier post-procesing
+def parse_json(a_filename, source_zip:zipfile.ZipFile)->list:
+    jfile = source_zip.read(a_filename)
+    # Data reduction => less RAM needed downstream and better performance.
+    jfile = preprocess_json(jfile, json_preprocessor_config)
+    try:
+        jfile = json.loads(jfile)
+        jfile = reduce_a_json_dict(jfile)
+    except json.JSONDecodeError as err:
+        context_before = 20
+        context_after = 20
+        with redirect_stdout(sys.stderr):
+            print('JSON error:',err)
+            print('JSON file begins with:',jfile[:60]) #Dump the cik
+            print('Error location:', err.doc[err.pos-context_before:err.pos+context_after])
+            try:
+                index_in_original = jfile.index(err.doc[err.pos-context_before:err.pos])
+                print('Original context:', jfile[index_in_original:index_in_original+context_before+context_after])
+            except:
+                pass
+        sys.exit(1) #Fatal, because it can only occur if the input data has an unexpected JSON schema...
+    except KeyError: # A valid json file with no usable data is not an error. Silently skipping...
+        jfile = list()
+    return jfile
 
-    parsed_data = list()
-    for jfile in list_of_json_files:
-        try:
-            # Data reduction => less RAM needed downstream and better performance.
-            jfile = json.loads(preprocess_json(jfile, json_preprocessor_config))
-        except json.JSONDecodeError as err:
-            context_before = 20
-            context_after = 20
-            with redirect_stdout(sys.stderr):
-                print('JSON error:',err)
-                print('JSON file begins with:',jfile[:60]) #Dump the cik
-                print('Error location:', err.doc[err.pos-context_before:err.pos+context_after])
-                try:
-                    index_in_original = jfile.index(err.doc[err.pos-context_before:err.pos])
-                    print('Original context:', jfile[index_in_original:index_in_original+context_before+context_after])
-                except:
-                    pass
-            sys.exit(1)
-        try:
-            parsed_data += reduce_a_json_dict(jfile)
-        except KeyError:
-            pass #A valid json file without financial data is not an error. Silently skipping...
+# %%
+def dicts_to_pandas(parsed_data:list):
+    #Always return a DataFrame for easier post-processing
+    df = pd.DataFrame(parsed_data)
 
-    if parsed_data:
-        df = pd.DataFrame(parsed_data)
+    if not df.empty:
         # For some facts the start date is not given, but the downstream logic depends on it.
         if 'start' not in df.columns:
             df['start'] = df['end']
@@ -285,7 +291,7 @@ def batch_convert_json(list_of_json_files):
     return df
 
 # %%
-def make_companyfacts(args, batch_size = 1000):
+def make_companyfacts(args, batch_size = 2000, worker_pool=None):
     # Here the list of files can be restricted for test and debugging purposes,
     # because the whole zip is large and takes time to process.
     debugging_slice = slice(None) if not args.partial_dataset else slice(0,2000)
@@ -298,14 +304,19 @@ def make_companyfacts(args, batch_size = 1000):
     files_to_parse = source_zip.namelist()[debugging_slice]
     print(f'Parsing {len(files_to_parse)} json files in batches of {batch_size}...')
 
-    job_results = pd.DataFrame()
-
     current_batch = 0
-    unzip_generator = (source_zip.read(a_file) for a_file in files_to_parse)
-    for a_batch in itertools.batched(unzip_generator, batch_size):
-        job_results = pd.concat([job_results] + Parallel()(delayed(batch_convert_json)([i]) for i in a_batch))
+    job_results = pd.DataFrame()
+    for a_batch_of_filenames in itertools.batched(files_to_parse, batch_size):
+        map_arguments = (parse_json, a_batch_of_filenames, [source_zip] * len(a_batch_of_filenames))
+        if worker_pool:
+            j_dict = worker_pool.map(*map_arguments)
+        else:
+            j_dict = map(*map_arguments)
+        j_dict = itertools.chain.from_iterable(j_dict)
+        job_results = pd.concat([job_results, dicts_to_pandas(j_dict)])
         current_batch += 1
         dump_memory_usage(f'Batch {current_batch} of json files completed')
+
     print(f'Financial data for {job_results.index.get_level_values("cik").nunique()} ciks was extracted.')
     source_zip.close()
 
@@ -411,21 +422,32 @@ def enrich_with_tickers(snapshots, tickers_info):
     return snapshots.merge(tickers_info[['ticker','exchange']],how='left',left_index=True,right_index=True)
 
 # %%
-@njit # Numba is the speed king!
-def scan_periods_to_dict(input_arr):
-    idx, start, end = (0,1,2) #Readable names for the columns of the array
+@njit(nogil=True) # Numba is the speed king!
+def scan_periods_to_dict(index_arr):
+    idx, cik, start, end = (0,1,2,3) #Readable names for the columns of the lookup array
+    row_count, column_count = (0,1)  #Readable names for the shape of the array
+
     output = dict()  #This is a numba dict, not a python dict! It behaves differently...
-    for i in prange(1, input_arr.shape[0]):
-        this_period = input_arr[i]
+
+    cik_start_i = 0  #Input array is already sorted by cik, we take advantage of it here
+    for i in range(1, index_arr.shape[row_count]):
+        this_period = index_arr[i]
+
+        # Make sure we operate only on rows with the same cik.
+        if index_arr[cik_start_i][cik] != this_period[cik]:
+            cik_start_i = i
+            continue
+
         # Here we enforce the following logic:
-        # index_earlier_period < index
-        earlier_periods = input_arr[:i]
-        # start_earlier_period >= start
-        # end_earlier_period <= end
+        # same cik AND index_earlier_period < this_index
+        earlier_periods = index_arr[cik_start_i:i]
+
+        # start_earlier_period >= start AND end_earlier_period <= end
         earlier_periods = earlier_periods[(earlier_periods[:,start] >= this_period[start])&(earlier_periods[:,end] <= this_period[end])]
-        earlier_periods_count = earlier_periods.shape[0]
-        if earlier_periods_count > 0:
+
+        if earlier_periods.shape[row_count] > 0:
             output[this_period[idx]] = earlier_periods[:,idx]
+
     return output
 
 # %%
@@ -451,20 +473,17 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
         # Columns of this lookup table are: ['index', 'cik', 'start', 'end']
         earlier_period_indexes = df.index.to_frame(index=False).reset_index(drop=False) #Create the 'index' column
 
-        # Integer comparisons are much faster than date comparisons, so we convert the dates to integers
-        for i in ['start','end']:
+        # Integer comparisons are much faster than date and string comparisons, so we convert everything to integers
+        for i in earlier_period_indexes.columns:
             earlier_period_indexes[i] = pd.to_numeric(earlier_period_indexes[i], downcast='integer')
 
-        # Period subtraction is only possible per-cik
-        earlier_period_indexes = earlier_period_indexes.groupby(by='cik')[['index','start','end']]
-        earlier_period_indexes = earlier_period_indexes.apply(lambda x:dict(scan_periods_to_dict(x.to_numpy())))
-        # earlier_period_indexes is now a pd.Series of dicts
+        assert earlier_period_indexes['cik'].is_monotonic_increasing == True
+        earlier_period_indexes = scan_periods_to_dict(earlier_period_indexes.to_numpy()) #numba dict of numpy index arrays
 
         # Subtracting earlier periods and modifying the dataset in numpy is much faster than in pandas
         numpy_df = df.loc[:,columns_to_process].to_numpy()
-        for indexes_of_a_single_cik in earlier_period_indexes:
-            for this_period in sorted(indexes_of_a_single_cik.keys()):
-                numpy_df[this_period] -= np.nansum(numpy_df[indexes_of_a_single_cik[this_period]],axis=0)
+        for this_period in sorted(earlier_period_indexes.keys()):
+            numpy_df[this_period] -= np.nansum(numpy_df[earlier_period_indexes[this_period]], axis=0)
 
         return numpy_df
 
@@ -537,7 +556,7 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     return a_pivot
 
 # %%
-def make_snapshots(companyfacts, args):
+def make_snapshots(companyfacts, args, worker_pool=None):
     # Keeping the index columns is vital to reduce the memory footprint. In its current form, the companyfacts
     # dataframe occupies about 1 GiB of RAM. If we do a .reset_index(drop=False), the size baloons to above 4GiB
     # Index columns are: filed,cik,end,start,fact
@@ -581,20 +600,21 @@ def make_snapshots(companyfacts, args):
     def make_single_pivot(a_date):
         active_ciks = defunct_dates[defunct_dates >= a_date].index.unique().tolist()
         a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & ( companyfacts.index.get_level_values('filed') < a_date )]
-        return a_date, a_pivot, tickers, args
+        return process_single_pivot(a_date, a_pivot, tickers, args)
 
     # We dump the results to stdout periodically, because otherwise RAM runs out pretty quickly.
-    # This ugly workaround with batches is needed, because the legacy multiprocessing backend does not support return_as='generator'
-    # By the way, re-using the worker pool by Prallel is possible, but for some reason this causes memory leaks that are very hard to track.
-    # The implementation below turned out to be the most memory efficient.
     dump_memory_usage('Start assembling snapshots')
     print(','.join(export_schema)) #Print the CSV header
     for a_batch in itertools.batched(dates_to_compute, 2*args.vCPUs):
-        print(''.join(Parallel()(delayed(process_single_pivot)(*make_single_pivot(i)) for i in a_batch)), end='')
+        if worker_pool:
+            results = worker_pool.map(make_single_pivot, a_batch)
+        else:
+            results = map(make_single_pivot, a_batch)
+        print(''.join(results), end='')
         dump_memory_usage('A batch was completed')
 
 # %%
-def main(args):
+def main(args, worker_pool=None):
     with redirect_stdout(sys.stderr):
         print('Python version:', sys.version)
         print('CLI switches:', args)
@@ -612,26 +632,21 @@ def main(args):
             else:
                 print(f'{intermediate_stage_name} found and loaded. Skipping json processing.')
         except:
-            companyfacts = make_companyfacts(args)
+            companyfacts = make_companyfacts(args, worker_pool=worker_pool)
             if args.dump_intermediate_stages:
                 print(f'Saving {intermediate_stage_name} as requested.')
                 companyfacts.to_csv(intermediate_stage_name)
-    make_snapshots(companyfacts.drop(columns=['val','corrected']), args) #val_final remains
+    make_snapshots(companyfacts.drop(columns=['val','corrected']), args, worker_pool=worker_pool) #val_final remains
 
 # %%
 if __name__ == "__main__":
     cli_args = parse_arguments()
-#   In my experience, the legacy backend is quite solid. The default 'loky' backend keeps throwing
-#   warnings about memory leaks of unknown origin and is too picky as it tries to pickle function arguments and global variables
-#   that cannot be pickled (ZipFile objects are one example).
-#   The threading backend works essentially with only one CPU core because of the python GIL and for now I cannot think
-#   of any way to make the logic in this program thread-safe without making an unmaintainable mess out of it.
-    with parallel_config(backend='multiprocessing', n_jobs=cli_args.max_jobs):
-        if cli_args.max_jobs == 1:
-            with cProfile.Profile(builtins=False) as pr:
-                main(cli_args)
-                pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('batch_convert_json')
-                pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('process_single_pivot')
-        else:
+    if cli_args.max_jobs == 1:
+        with cProfile.Profile(builtins=False) as pr:
             main(cli_args)
+            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('parse_json')
+            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('process_single_pivot')
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cli_args.vCPUs+1) as executor:
+            main(cli_args, executor)
     print('Done without errors.', file=sys.stderr)

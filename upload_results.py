@@ -10,4 +10,7 @@ assert file_name
 assert bucket_name in [i.name for i in list(client.list_buckets())]
 file_name += ".gz"
 print('Will upload to:', client.project, bucket_name, file_name, file=sys.stderr)
-client.bucket(bucket_name).blob(file_name).upload_from_string(sys.stdin.buffer.read(),timeout=5)
+input_file = sys.stdin.buffer.read()
+if len(input_file) > 2**20:
+    print(f'Starting upload of {len(input_file)//2**20} MiB to:', client.project, bucket_name, file_name, file=sys.stderr)
+    client.bucket(bucket_name).blob(file_name).upload_from_string(input_file, timeout=10)

@@ -2,5 +2,4 @@ regex
 pandas
 numpy
 numba
-joblib
 google-cloud-storage
