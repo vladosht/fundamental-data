@@ -200,12 +200,16 @@ def reduce_a_json_dict(jdict):
     We take the parsed json data and do data reduction/validation here,
     because we do not need most of the content
     """
-    # Basic sanity checks for the json contents. These checks fail with a KeyError
-    cik = str(jdict['cik']).zfill(10)  #A cik must be present
-    if not len(jdict['facts']['us-gaap'].keys()) >= 2:  #At least this many distinct facts must be present
-        raise KeyError('No actual data found in json file.')
+    j = list() #Always return a list, for simplified downstream logic
 
-    j = list()
+    # Basic sanity checks for the json contents. These checks fail with a KeyError
+    try:
+        cik = str(jdict['cik']).zfill(10)  #A cik must be present
+        if not len(jdict['facts']['us-gaap'].keys()) >= 2:  #At least this many distinct facts must be present
+            raise KeyError('No actual data found in json file.')
+    except KeyError: # A valid json file with no usable data is not an error. Silently skipping this file...
+        return j
+
     for fact_path in known_facts:
         taxonomy, fact, wanted_units = fact_path.split('.')
         wanted_units = [ wanted_units.lower() ]
@@ -223,31 +227,6 @@ def reduce_a_json_dict(jdict):
                 j += list(map(lambda x:x | {'cik': cik, 'fact': fact_path }, fact_data))
                 break
     return j
-
-# %%
-def parse_json(a_filename, source_zip:zipfile.ZipFile)->list:
-    jfile = source_zip.read(a_filename)
-    # Data reduction => less RAM needed downstream and better performance.
-    jfile = preprocess_json(jfile, json_preprocessor_config)
-    try:
-        jfile = json.loads(jfile)
-        jfile = reduce_a_json_dict(jfile)
-    except json.JSONDecodeError as err:
-        context_before = 20
-        context_after = 20
-        with redirect_stdout(sys.stderr):
-            print('JSON error:',err)
-            print('JSON file begins with:',jfile[:60]) #Dump the cik
-            print('Error location:', err.doc[err.pos-context_before:err.pos+context_after])
-            try:
-                index_in_original = jfile.index(err.doc[err.pos-context_before:err.pos])
-                print('Original context:', jfile[index_in_original:index_in_original+context_before+context_after])
-            except:
-                pass
-        sys.exit(1) #Fatal, because it can only occur if the input data has an unexpected JSON schema...
-    except KeyError: # A valid json file with no usable data is not an error. Silently skipping...
-        jfile = list()
-    return jfile
 
 # %%
 def dicts_to_pandas(parsed_data:list):
@@ -290,8 +269,23 @@ def dicts_to_pandas(parsed_data:list):
 
     return df
 
+def parse_json_batched(jlist):
+    """
+    Takes a list of uncompressed binary json files.
+    Returns a pandas DataFrame
+    """
+    jlist = b'[' + b','.join(jlist) + b']'  #binary string
+    jlist = preprocess_json(jlist, json_preprocessor_config) # Data reduction => less RAM and better performance.
+    jlist = json.loads(jlist) #reduced binary string
+    jlist = itertools.chain.from_iterable(map(reduce_a_json_dict, jlist)) #list of pruned dicts with the same schema
+    jlist = dicts_to_pandas(jlist) #A single DataFrame
+    min_cik, max_cik, count_cik = pd.Series(jlist.index.get_level_values('cik')).agg(['min','max','count'])
+    if count_cik % 3 == 0: #Print only a third of the times to not clutter stderr
+        print(f'CIKs from {min_cik} to {max_cik} completed', file=sys.stderr)
+    return jlist
+
 # %%
-def make_companyfacts(args, batch_size = 2000, worker_pool=None):
+def make_companyfacts(args, batch_size = 100):
     # Here the list of files can be restricted for test and debugging purposes,
     # because the whole zip is large and takes time to process.
     debugging_slice = slice(None) if not args.partial_dataset else slice(0,2000)
@@ -302,24 +296,17 @@ def make_companyfacts(args, batch_size = 2000, worker_pool=None):
     print(f"{len(source_zip)} bytes read.")
     source_zip = zipfile.ZipFile(io.BytesIO(source_zip), mode='r')
     files_to_parse = source_zip.namelist()[debugging_slice]
-    print(f'Parsing {len(files_to_parse)} json files in batches of {batch_size}...')
 
-    current_batch = 0
-    job_results = pd.DataFrame()
-    for a_batch_of_filenames in itertools.batched(files_to_parse, batch_size):
-        map_arguments = (parse_json, a_batch_of_filenames, [source_zip] * len(a_batch_of_filenames))
-        if worker_pool:
-            j_dict = worker_pool.map(*map_arguments)
-        else:
-            j_dict = map(*map_arguments)
-        j_dict = itertools.chain.from_iterable(j_dict)
-        job_results = pd.concat([job_results, dicts_to_pandas(j_dict)])
-        current_batch += 1
-        dump_memory_usage(f'Batch {current_batch} of json files completed')
+    dump_memory_usage(f'Parsing {len(files_to_parse)} json files in batches of {batch_size}')
+
+    # These are 'lazy' executions, so that we do not decompress the whole zip into memory all at once.
+    batches = itertools.batched(map(source_zip.read, files_to_parse), batch_size)
+
+    job_results = concurrent_map_fn(parse_json_batched, batches)
+    job_results = pd.concat(job_results)
 
     print(f'Financial data for {job_results.index.get_level_values("cik").nunique()} ciks was extracted.')
     source_zip.close()
-
     return job_results
 
 # %%
@@ -552,11 +539,14 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
 
     ciks_nunique = a_pivot.index.get_level_values('cik').nunique()
     a_pivot = a_pivot.to_csv(index=True, header=False, date_format='%Y-%m-%d', float_format='%f')
-    print(f'Snapshot {a_date.date()}: {ciks_nunique} unique ciks processed into a CSV string of {sys.getsizeof(a_pivot)/2**20:.2f}MB.', file=sys.stderr)
+    print(f'Snapshot {a_date.date()}: {ciks_nunique} unique ciks processed.', file=sys.stderr)
     return a_pivot
 
+def call_single_pivot(args):
+    return process_single_pivot(*args)
+
 # %%
-def make_snapshots(companyfacts, args, worker_pool=None):
+def make_snapshots(companyfacts, args):
     # Keeping the index columns is vital to reduce the memory footprint. In its current form, the companyfacts
     # dataframe occupies about 1 GiB of RAM. If we do a .reset_index(drop=False), the size baloons to above 4GiB
     # Index columns are: filed,cik,end,start,fact
@@ -597,29 +587,24 @@ def make_snapshots(companyfacts, args, worker_pool=None):
     # This provides a significant performance boost, too
     defunct_dates = companyfacts.groupby(by=['cik','filed']).first().index.to_frame(index=False).groupby('cik')['filed'].max() + pd.DateOffset(months=13)
 
-    def make_single_pivot(a_date):
+    def make_pivot_parameters(a_date):
         active_ciks = defunct_dates[defunct_dates >= a_date].index.unique().tolist()
         a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & ( companyfacts.index.get_level_values('filed') < a_date )]
-        return process_single_pivot(a_date, a_pivot, tickers, args)
+        return a_date, a_pivot, tickers, args
 
-    # We dump the results to stdout periodically, because otherwise RAM runs out pretty quickly.
+    pivot_parameters = map(make_pivot_parameters, dates_to_compute)
+
     dump_memory_usage('Start assembling snapshots')
     print(','.join(export_schema)) #Print the CSV header
-    for a_batch in itertools.batched(dates_to_compute, 2*args.vCPUs):
-        if worker_pool:
-            results = worker_pool.map(make_single_pivot, a_batch)
-        else:
-            results = map(make_single_pivot, a_batch)
-        print(''.join(results), end='')
-        dump_memory_usage('A batch was completed')
+    job_results = concurrent_map_fn(call_single_pivot, pivot_parameters)
+    print(''.join(job_results), end='')
 
 # %%
 def main(args, worker_pool=None):
     with redirect_stdout(sys.stderr):
         print('Python version:', sys.version)
         print('CLI switches:', args)
-        print(f'Using {args.vCPUs} CPU(s), you should have at least {max(2,args.vCPUs)*4} GiB of RAM.')
-        dump_memory_usage('Program start')
+        print(f'Using {args.vCPUs} CPU(s), you should have at least {max(4,args.vCPUs)*2} GiB of RAM.')
         intermediate_stage_name = 'companyfacts.csv.gz'
         try:
             #If the intermediate stage is already present in the working directory, load it.
@@ -632,21 +617,24 @@ def main(args, worker_pool=None):
             else:
                 print(f'{intermediate_stage_name} found and loaded. Skipping json processing.')
         except:
-            companyfacts = make_companyfacts(args, worker_pool=worker_pool)
+            companyfacts = make_companyfacts(args)
             if args.dump_intermediate_stages:
                 print(f'Saving {intermediate_stage_name} as requested.')
                 companyfacts.to_csv(intermediate_stage_name)
-    make_snapshots(companyfacts.drop(columns=['val','corrected']), args, worker_pool=worker_pool) #val_final remains
+    make_snapshots(companyfacts.drop(columns=['val','corrected']), args) #val_final remains
 
 # %%
 if __name__ == "__main__":
     cli_args = parse_arguments()
     if cli_args.max_jobs == 1:
         with cProfile.Profile(builtins=False) as pr:
+            concurrent_map_fn = map
             main(cli_args)
-            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('parse_json')
+            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('parse_json_batched')
             pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('process_single_pivot')
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cli_args.vCPUs+1) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=cli_args.vCPUs+1) as executor:
+            # The buffersize parameter is critical, otherwise RAM runs out almost immediately with no benefit at all
+            concurrent_map_fn = lambda fn, *fn_iter: executor.map(fn, *fn_iter, buffersize=cli_args.vCPUs)
             main(cli_args, executor)
     print('Done without errors.', file=sys.stderr)
