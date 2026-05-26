@@ -31,5 +31,4 @@ RUN df -h &&\
     pip install --no-cache-dir --user -r requirements.txt &&\
     python3 -c 'import pandas; pandas.show_versions()'
 
-# Multiprocessing seems to cause problems in Google Cloud Run, so we turn it off.
-ENTRYPOINT ["./run.sh", "--max-jobs=1"]
+ENTRYPOINT ["./run.sh"]

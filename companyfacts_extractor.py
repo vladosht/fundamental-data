@@ -438,7 +438,7 @@ def scan_periods_to_dict(index_arr):
     return output
 
 # %%
-def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
+def process_single_pivot(a_date, a_pivot, args):
     # We need a new order of the keys, so that sorting along them will make possible the do_subtract logic below.
     a_pivot = a_pivot.reorder_levels(['cik','fact','start','end','quarter_count','filed']).sort_index().droplevel('filed', axis='index')
     a_pivot = a_pivot[~a_pivot.index.duplicated(keep='last')].unstack(level='fact').droplevel(0, axis='columns')
@@ -527,19 +527,12 @@ def process_single_pivot(a_date, a_pivot, tickers_mapping, args):
     columns_to_round.remove('Employees')
     a_pivot[columns_to_round] = a_pivot[columns_to_round].map(lambda x:round(x/1e9, 6), na_action='ignore')
 
-    # After the rounding run we can now add the ticker and exchange columns, which are strings.
-    a_pivot = enrich_with_tickers(a_pivot, tickers_mapping)
-
     # Add the snapshot date as the left-most index column
     a_pivot['snapshot'] = a_date
     a_pivot = a_pivot.set_index('snapshot', append=True)
     a_pivot = a_pivot.reorder_levels(['snapshot','cik','date'])
 
-    a_pivot = a_pivot[[i for i in export_schema if i not in list(a_pivot.index.names)]]  #enforce consistent column order across versions
-
-    ciks_nunique = a_pivot.index.get_level_values('cik').nunique()
-    a_pivot = a_pivot.to_csv(index=True, header=False, date_format='%Y-%m-%d', float_format='%f')
-    print(f'Snapshot {a_date.date()}: {ciks_nunique} unique ciks processed.', file=sys.stderr)
+    print(f'Snapshot {a_date.date()}: {a_pivot.index.get_level_values('cik').nunique()} unique ciks processed.', file=sys.stderr)
     return a_pivot
 
 def call_single_pivot(args):
@@ -553,9 +546,9 @@ def make_snapshots(companyfacts, args):
     # Value column is: val_final
     # These come largely from variable data_column_names in function batch_convert_json
 
-    print('Pre-compiling numba functions...', file=sys.stderr)  #Because they are used within the worker processes...
+    print('Pre-compiling numba functions...')  #Because they are used within the worker processes...
     scan_periods_to_dict(np.zeros(shape=(1,3)))
-    print('Compile succeeded.', file=sys.stderr)
+    print('Compile succeeded.')
 
     today = datetime.datetime.today().date()
     dates_to_compute = [ datetime.date(year,month,1) for year in list(range(2013,today.year+1)) for month in list(range(1,13)) ]
@@ -564,7 +557,37 @@ def make_snapshots(companyfacts, args):
         dates_to_compute = [ dates_to_compute[i] for i in [0,1,-1] ]
     dates_to_compute.append(today)
     dates_to_compute = pd.to_datetime(dates_to_compute)
-    print(f"Total number of dates to create snapshots for: {len(dates_to_compute)}", file=sys.stderr)
+    print(f"Total number of dates to create snapshots for: {len(dates_to_compute)}")
+
+    # We assume a cik no longer files with the SEC if its last filing date is at least one year earlier than the snapshot date.
+    # We ignore these ciks to not clutter the output dataset with identical records for defunct ciks.
+    # This provides a significant performance boost, too
+    defunct_dates = companyfacts.groupby(by=['cik','filed']).first().index.to_frame(index=False).groupby('cik')['filed'].max() + pd.DateOffset(months=13)
+
+    def make_pivot_parameters(a_date):
+        active_ciks = defunct_dates[defunct_dates >= a_date].index.unique().tolist()
+        a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & ( companyfacts.index.get_level_values('filed') < a_date )]
+        return a_date, a_pivot, args
+
+    pivot_parameters = map(make_pivot_parameters, dates_to_compute)
+
+    dump_memory_usage('Start assembling snapshots')
+    job_results = concurrent_map_fn(call_single_pivot, pivot_parameters)
+    return pd.concat(job_results)
+
+def post_process_dataset(snapshots):
+    # There are several ciks, that have reported wrong data 1000 times larger than actual.
+    # They apparently never submitted a correction. Also, some ciks have assets close to zero.
+    # These errors disrupt downstream data usage and thus we remove the whole ciks.
+    asset_outliers = snapshots.groupby(by='cik')['Assets'].aggregate(['min','max'])
+    zero_asset_ciks = asset_outliers['max'].fillna(0.0).abs() 
+    zero_asset_ciks = zero_asset_ciks[zero_asset_ciks < 1e-3].index.get_level_values('cik').unique().tolist()
+    asset_outliers = (asset_outliers['min']/asset_outliers['max']).sort_values().fillna(0.0)
+    asset_outliers = asset_outliers[asset_outliers<1e-3].index.get_level_values('cik').unique().tolist()
+    ciks_to_exclude = set(zero_asset_ciks).union(asset_outliers)
+
+    print(f'{len(ciks_to_exclude)/snapshots.index.get_level_values('cik').nunique():.1%} of ciks removed due to invalid Assets data')
+    snapshots = snapshots[~snapshots.index.isin(ciks_to_exclude, level='cik')]
 
     # If cik-to-ticker mapping from the SEC is available, use it
     try:
@@ -579,32 +602,23 @@ def make_snapshots(companyfacts, args):
         tickers['ticker'] = tickers.apply(lambda row: str(row.ticker[:row.len]),axis='columns').str.rstrip().str.rstrip('-').str.upper()
         tickers = tickers.sort_values(by=['cik','exchange','ticker','len']).drop_duplicates(subset=['cik'],keep='first').set_index('cik').drop(columns=['len'])
     except:
-        print(f'company_tickers_exchange.json not found in {os.getcwd()} or unreadable. Ticker columns will be empty.', file=sys.stderr)
+        print(f'company_tickers_exchange.json not found in {os.getcwd()} or unreadable. Ticker columns will be empty.')
         tickers = None
 
-    # We assume a cik no longer files with the SEC if its last filing date is at least one year earlier than the snapshot date.
-    # We ignore these ciks to not clutter the output dataset with identical records for defunct ciks.
-    # This provides a significant performance boost, too
-    defunct_dates = companyfacts.groupby(by=['cik','filed']).first().index.to_frame(index=False).groupby('cik')['filed'].max() + pd.DateOffset(months=13)
+    # We can now add the ticker and exchange columns, which are strings.
+    snapshots = enrich_with_tickers(snapshots.copy(), tickers)
 
-    def make_pivot_parameters(a_date):
-        active_ciks = defunct_dates[defunct_dates >= a_date].index.unique().tolist()
-        a_pivot = companyfacts[companyfacts.index.isin(active_ciks, level='cik') & ( companyfacts.index.get_level_values('filed') < a_date )]
-        return a_date, a_pivot, tickers, args
+    # Enforce consistent column order across versions
+    snapshots = snapshots[[i for i in export_schema if i not in list(snapshots.index.names)]] 
 
-    pivot_parameters = map(make_pivot_parameters, dates_to_compute)
-
-    dump_memory_usage('Start assembling snapshots')
-    print(','.join(export_schema)) #Print the CSV header
-    job_results = concurrent_map_fn(call_single_pivot, pivot_parameters)
-    print(''.join(job_results), end='')
+    return snapshots
 
 # %%
 def main(args, worker_pool=None):
     with redirect_stdout(sys.stderr):
         print('Python version:', sys.version)
         print('CLI switches:', args)
-        print(f'Using {args.vCPUs} CPU(s), you should have at least {max(4,args.vCPUs)*2} GiB of RAM.')
+        print(f'Using {args.vCPUs} CPU(s), you should have at least {max(8,args.vCPUs*3)} GiB of RAM.')
         intermediate_stage_name = 'companyfacts.csv.gz'
         try:
             #If the intermediate stage is already present in the working directory, load it.
@@ -621,7 +635,10 @@ def main(args, worker_pool=None):
             if args.dump_intermediate_stages:
                 print(f'Saving {intermediate_stage_name} as requested.')
                 companyfacts.to_csv(intermediate_stage_name)
-    make_snapshots(companyfacts.drop(columns=['val','corrected']), args) #val_final remains
+        companyfacts = make_snapshots(companyfacts.drop(columns=['val','corrected']), args) #val_final remains
+        print('Finalizing dataset and exporting as CSV.')
+        companyfacts = post_process_dataset(companyfacts)
+    companyfacts.to_csv(sys.stdout, index=True, header=True, date_format='%Y-%m-%d', float_format='%f')
 
 # %%
 if __name__ == "__main__":
@@ -630,8 +647,9 @@ if __name__ == "__main__":
         with cProfile.Profile(builtins=False) as pr:
             concurrent_map_fn = map
             main(cli_args)
-            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('parse_json_batched')
-            pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative').print_callees('process_single_pivot')
+            perf = pstats.Stats(pr, stream=sys.stderr).sort_stats('cumulative')
+            perf.print_callees('parse_json_batched')
+            perf.print_callees('process_single_pivot')
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=cli_args.vCPUs+1) as executor:
             # The buffersize parameter is critical, otherwise RAM runs out almost immediately with no benefit at all
