@@ -51,6 +51,7 @@ All source files rely on self-documentation, so just look at them. The AGENTS.md
 *companyfacts_extractor.py* was developed and tested in a Google Cloud Platform Virtual Machine of type n4d-standard-2  
 It is a 2vCPU, 8GiB RAM amd64 instance, running Debian GNU/Linux 13 (trixie).  
 The sysbench (v1.0.20) score of the instance, obtained with `sysbench --threads=$(nproc) cpu run`, is 5375.75  
-In this instance, the program runs to completion within 20 min. This amounts to a cost of about $0.04 per full dataset run.  
+In this instance, the program runs to completion within 10 min. This amounts to a cost of about \$0.02 per full dataset run.  
+The Cloud Run Job, as created by the `deploy.sh` with 8 vCPUs and 16 GiB of RAM runs for about 7 minutes.  
 The output of the script is a utf-8 CSV text stream. When captured and compressed with gzip, it takes up less than 100MiB of disk space.  
 The program is a native command line tool which is quite verbose, but only on stderr. Standard output is reserved only for the CSV stream. Therefore, it should be readily usable by AI agents.

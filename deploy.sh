@@ -22,7 +22,7 @@ fi
 gcloud run jobs deploy "$JOB_NAME" --source=. \
   --set-env-vars="SNAPSHOTS_SEC_UA=$SNAPSHOTS_SEC_UA" \
   --set-env-vars="SNAPSHOTS_TARGET_FILE=$SNAPSHOTS_TARGET_FILE" \
-  --tasks=1 --cpu=6 --memory=16Gi --max-retries=0 --task-timeout=60m || exit 1
+  --tasks=1 --cpu=8 --memory=16Gi --max-retries=0 --task-timeout=15m || exit 1
 
 cat >&2 << EOF
 Regardless of how you start the job, you can observe its logs in real time with a command like this:
