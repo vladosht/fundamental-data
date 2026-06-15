@@ -279,9 +279,10 @@ def parse_json_batched(jlist):
     jlist = json.loads(jlist) #reduced binary string
     jlist = itertools.chain.from_iterable(map(reduce_a_json_dict, jlist)) #list of pruned dicts with the same schema
     jlist = dicts_to_pandas(jlist) #A single DataFrame
-    min_cik, max_cik, count_cik = pd.Series(jlist.index.get_level_values('cik')).agg(['min','max','count'])
-    if count_cik % 3 == 0: #Print only a third of the times to not clutter stderr
-        print(f'CIKs from {min_cik} to {max_cik} completed', file=sys.stderr)
+    if not jlist.empty:
+        min_cik, max_cik, count_cik = pd.Series(jlist.index.get_level_values('cik')).agg(['min','max','count'])
+        if count_cik % 3 == 0: #Print only a third of the times to not clutter stderr
+            print(f'CIKs from {min_cik} to {max_cik} completed', file=sys.stderr)
     return jlist
 
 # %%
